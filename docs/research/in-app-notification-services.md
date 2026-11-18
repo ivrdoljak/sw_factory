@@ -3,7 +3,7 @@
 Research for the wayfinder ticket "What do hosted in-app notification services offer versus building in-house?" (ivrdoljak/sw_factory#11), part of the map "Wayfinder: In-app Notifications for Cadence" (#9).
 
 - **Researched:** 2026-11-18. Prices and limits change often, so recheck the pricing pages before relying on them.
-- **Sources:** vendor docs, pricing pages, official GitHub repos and the npm registry. Every claim links to its source.
+- **Sources:** vendor docs, pricing pages, official GitHub repos and the npm registry. Most claims link to their source. A few rest on reading published npm tarballs or source code, or on search-engine summaries of vendor pages; those are marked in the text.
 - **Labels:** "unverified" means I found no primary source. "Inference" means the conclusion is mine, not a vendor's statement.
 - **Scope:** this file collects facts for the build-or-buy decision. It does not make that decision.
 
@@ -46,17 +46,17 @@ Billing units differ, so free tiers that look alike are not. "Per channel" means
 |---|---|---|---|---|---|---|---|
 | **React inbox UI** | Prebuilt popover, feed and bell, plus hooks | Prebuilt `<Inbox>`, Bell and Preferences, plus hooks or headless JS | Prebuilt Web Components wrapped for React, plus the `useCourier` hook | Prebuilt floating inbox and preferences; no documented hooks | Prebuilt Inbox and feed, plus headless hooks | Prebuilt list, plus hooks | Build it with shadcn (no popover component exists yet) |
 | **React 19** | peer `^17\|\|^18\|\|^19` | peer `^18\|\|^19` | peer `>=18`, client-side render only | no peer declared | peer `>=16.8`; a dependency declares React ≤18 | peer `^18\|\|^19` | n/a |
-| **Realtime** | WebSocket (Phoenix channels), no polling fallback | WebSocket (PartySocket on Cloud, socket.io self-hosted) | WebSocket | WebSocket | WebSocket (socket.io) | **Polling every 60 s** | Polling or SSE (a resource route) |
+| **Realtime** | WebSocket (Phoenix channels), no polling fallback | WebSocket (PartySocket on Cloud, socket.io self-hosted) | WebSocket | WebSocket | WebSocket (socket.io) | **Polling every 60 s** (React client; no push path found, but not ruled out) | Polling or SSE (a resource route) |
 | **Billing unit** | Message, counted per user **per channel** | Workflow run, counted per subscriber (all channels in one run) | Send, counted per recipient (**all channels count as one**) | Delivery, counted per user **per channel** | Notification, counted per user **per channel** | Event, counted per user | n/a |
-| **Free tier** | 10k messages a month, soft limit | 10k runs a month, **hard stop (HTTP 402)** | 10k sends a month | **1k** deliveries a month | 10k notifications a month, soft limit | **200** events a month, hard cap | n/a |
-| **First paid tier** | $250/mo, 50k messages, then $0.005 each | $30/mo, 30k runs, then $1.20 per 1k | Pay as you go at $0.005 a send, first 10k included (50k = $250) | $249/mo, 50k deliveries, then $0.0025 each | $100/mo, 50k (Essentials). Preferences and digest need $250/mo (Business) | $30/mo in credits, $0.005 an event | Hosting you already pay for |
-| **Branding on free tier** | "Powered by Knock" | Novu branding | None found (unverified) | not stated | SuprSend branding | Liveblocks branding | none |
+| **Free tier** | 10k messages a month, soft limit | 10k runs a month, **hard stop (HTTP 402)** | 10k sends a month | **1k** deliveries a month | 10k notifications a month; behaviour past the limit unclear (pricing says "Switch to Essentials") | **200** events a month, hard cap | n/a |
+| **First paid tier** | $250/mo, 50k messages, then $0.005 each | $30/mo, 30k runs, then $1.20 per 1k | Pay as you go at $0.005 a send, and the first 10k are billed too (50k = $250) | $249/mo, 50k deliveries, then $0.0025 each | $100/mo, 50k (Essentials). Preferences and digest need $250/mo (Business) | $30/mo in credits, $0.005 an event | Hosting you already pay for |
+| **Branding on free tier** | "Powered by Knock" | Novu branding | None found (unverified) | not researched | SuprSend branding | Liveblocks branding | none |
 | **Postmark** | Native | Native | Native | **Not native** (SMTP only) | Native | You send it yourself from a webhook | Existing `mailer.server.ts` |
 | **Digest or batching** | Batch step, on all plans | Digest on all plans (Free window: 1 day) | Listed under Enterprise on the pricing page | None | Business ($250/mo) and up | Per-kind batching, up to 50 | Build it |
 | **Preferences UI** | Hooks only, build the UI yourself | Prebuilt, Free tier included | Prebuilt `<CourierPreferences>` | Prebuilt `UserPreferences` | Business ($250/mo) and up | Hooks only (beta) | Build it |
-| **In-app retention** | Indefinite; custom retention not supported | 30 days (Free), 90 days (paid) | Not documented (unverified); per-message expiry exists | Not documented | Expiry set per template | Not documented | Your choice |
+| **In-app retention** | Indefinite; custom retention not supported (the pricing page says "unlimited but configurable", a conflict) | 30 days (Free), 90 days (paid) | Not documented (unverified); per-message expiry exists | Not researched | Expiry set per template | Not researched | Your choice |
 | **EU region** | **None yet** ("expected by end of 2026") | US and EU on all plans | EU (Ireland) on paid plans only | None documented | In the docs, but the pricing page lists it as Enterprise (conflict) | Enterprise only | Wherever you host |
-| **Self-host / OSS** | No (SDKs MIT/Apache) | **Yes: MIT core.** Needs MongoDB, Redis, S3 and 4 services | No ("managed cloud only") | No | Enterprise only (Kubernetes, Postgres, ClickHouse, …) | Enterprise add-on | It is your code |
+| **Self-host / OSS** | None documented (SDKs MIT/Apache) | **Yes: MIT core.** Needs MongoDB, Redis, S3 and 4 services | No ("managed cloud only") | No | Enterprise only (Kubernetes, Postgres, ClickHouse, …) | Enterprise add-on | It is your code |
 
 ## What the decision hinges on
 
@@ -70,7 +70,7 @@ Billing units differ, so free tiers that look alike are not. "Per channel" means
    - Knock does not offer it yet.
    - MagicBell documents nothing, and SuprSend's sources conflict.
    - Notification payloads would hold Student names and course activity.
-3. **What happens at the free-tier limit.** Novu Free rejects triggers with HTTP 402, so in-app notifications stop arriving. Knock and SuprSend use soft limits. Courier makes you move to pay-as-you-go to go past 10k.
+3. **What happens at the free-tier limit.** Novu Free rejects triggers with HTTP 402, so in-app notifications stop arriving. Knock does not hard-cap ("We don't hard cap your messages"). SuprSend's pricing page only says "Switch to Essentials for additional notifications", so its behaviour past the limit is unverified. Courier makes you move to pay-as-you-go to go past 10k.
 4. **How much of the "Not yet specified" list a vendor would decide for us.** Preferences, digests and retention come built in from Novu, and from Knock or SuprSend at different price points. In-house, each of them is something to build. If the catalogue stays small and preferences stay out of scope, the in-house build stays small.
 5. **Cost of the integration seam against what the stack already gives us.**
    - Every vendor adds:
@@ -112,7 +112,7 @@ Billing units differ, so free tiers that look alike are not. "Per channel" means
 - **Residency and lock-in:**
   - US only for now: "We expect to support EU data residency by the end of 2026" ([plans](https://docs.knock.app/manage-your-account/knock-plans)).
   - Messages can be exported through `GET /v1/messages` and the user feed endpoints ([knock-node api.md](https://github.com/knocklabs/knock-node/blob/main/api.md)).
-  - No self-hosting.
+  - No self-hosted option is documented (a negative search result, not a vendor statement).
 - **Dev and tests:** the in-app channel has no sandbox mode ([plans](https://docs.knock.app/manage-your-account/knock-plans)). Tests would mock the SDK.
 
 ### Novu
@@ -233,7 +233,7 @@ Billing units differ, so free tiers that look alike are not. "Per channel" means
 
 - **Liveblocks Notifications** ([hooks](https://liveblocks.io/docs/products/notifications/hooks), [pricing](https://liveblocks.io/pricing)):
   - **Components:** `@liveblocks/react` and `@liveblocks/react-ui`, peer React `^18||^19`. Hooks include `useUnreadInboxNotificationsCount`, `useMarkAllInboxNotificationsAsRead` and others. There is a prebuilt `InboxNotificationList`.
-  - **Realtime is polling.** The React package polls inbox notifications every **1 minute** ([config.ts](https://github.com/liveblocks/liveblocks/blob/main/packages/liveblocks-react/src/config.ts)).
+  - **Realtime is polling.** The React package polls inbox notifications every **1 minute** ([config.ts](https://github.com/liveblocks/liveblocks/blob/main/packages/liveblocks-react/src/config.ts)). Whether any additional push path exists was not checked.
   - **Model:** trigger one user at a time with `triggerInboxNotification`. There are no workflows or templates, and no archive (only delete).
   - **Email:** a webhook to your own server, where you send through your own provider, Postmark included ([email notifications](https://liveblocks.io/docs/products/notifications/email-notifications)).
   - **Pricing:** Free has 200 custom events a month as a hard cap, with branding. Pro is $30 a month in credits at $0.005 an event.
@@ -307,7 +307,7 @@ How the pieces would fit, with sources:
 | Item | What vendors give | In-house |
 |---|---|---|
 | Preferences / muting | Novu: prebuilt on Free. Courier and MagicBell: prebuilt. Knock: hooks only. SuprSend: Business only. Liveblocks: hooks (beta). | Table and UI to build |
-| Retention | Knock: indefinite, not configurable. Novu: 30 or 90 days, fixed by plan. SuprSend: per-template expiry. Customer.io: 60 days or less. | Your policy (a cleanup job) |
+| Retention | Knock: indefinite, not configurable (the pricing page says "configurable", a conflict). Novu: 30 or 90 days, fixed by plan. SuprSend: per-template expiry. Customer.io: 60 days or less. | Your policy (a cleanup job) |
 | Grouping / batching | Knock: batch step. Novu: digest (1 day on Free). SuprSend: Business only. Courier: Enterprise per the pricing page. MagicBell: none. Liveblocks: per-kind batching. | Build it, or group at read time |
 | Data model / seam | Vendor-owned store, plus user sync and a token-signing endpoint | Your table, behind a `notify()` seam |
 | Observability in dev/tests | Vendor dashboards and logs. Tests mock the SDK. | DB rows, like `.outbox/` |
