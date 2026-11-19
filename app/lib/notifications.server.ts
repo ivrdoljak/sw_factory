@@ -1,4 +1,4 @@
-import { and, count, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { alias } from "drizzle-orm/sqlite-core";
 import * as schema from "~/db/schema";
@@ -73,12 +73,22 @@ type NewQuestionEvent = {
   raisedAt: Date;
 };
 
+type NewReplyEvent = {
+  kind: NotificationEventKind.NewReply;
+  /** Whoever replied: the author of the reply. */
+  actorId: number;
+  /** The reply, not the question it answers. */
+  commentId: number;
+  raisedAt: Date;
+};
+
 /** A Notification Event with its facts: which kind, who acted, and the ids involved. */
 export type NotificationEvent =
   | RefundDecisionEvent
   | RefundRequestRaisedEvent
   | SeatClaimedEvent
-  | NewQuestionEvent;
+  | NewQuestionEvent
+  | NewReplyEvent;
 
 // ─── Write side ───
 
@@ -135,6 +145,8 @@ function findDelivery(tx: Tx, event: NotificationEvent): Delivery {
       return seatClaimedDelivery(tx, event);
     case NotificationEventKind.NewQuestion:
       return newQuestionDelivery(tx, event);
+    case NotificationEventKind.NewReply:
+      return newReplyDelivery(tx, event);
   }
 }
 
@@ -255,6 +267,48 @@ function newQuestionDelivery(tx: Tx, event: NewQuestionEvent): Delivery {
   };
 }
 
+/**
+ * A reply goes to everyone who has posted in its thread: the question's author
+ * and every replier. Deleted comments still count their authors as having
+ * posted. `notify` drops the replier and anyone listed twice.
+ */
+function newReplyDelivery(tx: Tx, event: NewReplyEvent): Delivery {
+  const found = tx
+    .select({
+      questionId: comments.parentId,
+      lessonId: lessons.id,
+      courseId: courses.id,
+    })
+    .from(comments)
+    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .innerJoin(courses, eq(modules.courseId, courses.id))
+    .where(eq(comments.id, event.commentId))
+    .get();
+
+  if (!found || found.questionId === null) return NOBODY;
+
+  const posters = tx
+    .select({ authorId: comments.userId })
+    .from(comments)
+    .where(
+      or(
+        eq(comments.id, found.questionId),
+        eq(comments.parentId, found.questionId)
+      )
+    )
+    .all();
+
+  return {
+    recipientIds: posters.map((poster) => poster.authorId),
+    references: {
+      courseId: found.courseId,
+      lessonId: found.lessonId,
+      commentId: event.commentId,
+    },
+  };
+}
+
 // ─── Read side ───
 
 /** A Notification ready to display. */
@@ -305,11 +359,11 @@ export const NOTIFICATIONS_PAGE_SIZE = 20;
 export type NotificationFilter = "all" | "unread";
 
 /**
- * A position in the list. The list is sorted by (raisedAt, id), not by id
- * alone, since `raisedAt` comes from the event and doesn't follow insertion
- * order, so a cursor is that pair.
+ * Where a Notification sits in the list: the (raisedAt, id) pair it's sorted
+ * by. Not the id alone, since `raisedAt` comes from the event and doesn't
+ * follow insertion order.
  */
-export type NotificationCursor = Pick<NotificationForDisplay, "raisedAt" | "id">;
+export type NotificationPosition = Pick<NotificationForDisplay, "raisedAt" | "id">;
 
 /** Which of the recipient's Notifications to list. */
 export type NotificationListQuery = {
@@ -317,7 +371,12 @@ export type NotificationListQuery = {
   /** "all" unless given. */
   filter?: NotificationFilter;
   /** Only Notifications older than this one: "Load older" passes the oldest shown. */
-  before?: NotificationCursor;
+  before?: NotificationPosition;
+  /**
+   * Only Notifications raised after this one: the newest one shown, for the
+   * polling check that adds arrivals to the top of an open drawer.
+   */
+  newerThan?: NotificationPosition;
 };
 
 /** One page of the drawer's list, and whether older Notifications exist past it. */
@@ -346,6 +405,7 @@ export function listNotificationPage(
     limit = NOTIFICATIONS_PAGE_SIZE,
     filter = "all",
     before,
+    newerThan,
   }: NotificationListQuery = {}
 ): NotificationPage {
   const rows = selectNotifications(db)
@@ -353,7 +413,8 @@ export function listNotificationPage(
       and(
         eq(notifications.recipientId, recipientId),
         filter === "unread" ? isNull(notifications.readAt) : undefined,
-        before ? olderThan(before) : undefined
+        before && sortsBelow(before),
+        newerThan && sortsAbove(newerThan)
       )
     )
     .orderBy(desc(notifications.raisedAt), desc(notifications.id))
@@ -371,14 +432,19 @@ export function listNotificationPage(
   };
 }
 
-/** Sorted after the cursor in the newest-first list. */
-function olderThan(cursor: NotificationCursor) {
+/** Raised earlier than the given position, or at the same time and stored earlier. */
+function sortsBelow({ raisedAt, id }: NotificationPosition) {
   return or(
-    lt(notifications.raisedAt, cursor.raisedAt),
-    and(
-      eq(notifications.raisedAt, cursor.raisedAt),
-      lt(notifications.id, cursor.id)
-    )
+    lt(notifications.raisedAt, raisedAt),
+    and(eq(notifications.raisedAt, raisedAt), lt(notifications.id, id))
+  );
+}
+
+/** Raised later than the given position, or at the same time and stored later. */
+function sortsAbove({ raisedAt, id }: NotificationPosition) {
+  return or(
+    gt(notifications.raisedAt, raisedAt),
+    and(eq(notifications.raisedAt, raisedAt), gt(notifications.id, id))
   );
 }
 
@@ -500,9 +566,8 @@ function renderKind(row: NotificationRow): Rendered | null {
       return renderSeatClaimed(row);
     case NotificationEventKind.NewQuestion:
       return renderNewQuestion(row);
-    // Not raised yet: each gets its renderer with the ticket that raises it.
     case NotificationEventKind.NewReply:
-      return null;
+      return renderNewReply(row);
   }
 }
 
@@ -562,6 +627,15 @@ function refundDecisionLink(row: NotificationRow): string {
 function renderNewQuestion(row: NotificationRow): Rendered {
   return {
     title: `${actorName(row)} asked a question on ${lessonTitle(row)}`,
+    link: commentLink(row),
+    detail: commentDetail(row),
+    refundStatus: null,
+  };
+}
+
+function renderNewReply(row: NotificationRow): Rendered {
+  return {
+    title: `${actorName(row)} replied on ${lessonTitle(row)}`,
     link: commentLink(row),
     detail: commentDetail(row),
     refundStatus: null,

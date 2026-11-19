@@ -1,4 +1,11 @@
-import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 import { Link, useFetcher, useNavigate } from "react-router";
 import {
   Bell,
@@ -11,10 +18,10 @@ import {
 } from "lucide-react";
 import { NotificationEventKind, RefundStatus } from "~/db/schema";
 import type {
-  NotificationCursor,
   NotificationFilter,
   NotificationForDisplay,
   NotificationPage,
+  NotificationPosition,
 } from "~/lib/notifications.server";
 import type { loader as notificationsLoader } from "~/routes/api.notifications";
 import { cn, formatRelativeTime } from "~/lib/utils";
@@ -40,12 +47,23 @@ const FILTERS: { value: NotificationFilter; label: string }[] = [
   { value: "unread", label: "Unread" },
 ];
 
-type NotificationsDrawerProps = { unreadCount: number };
+type NotificationsDrawerProps = {
+  /** The count from the app layout loader, fresh on every page change. */
+  unreadCount: number;
+};
 
-export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
+export function NotificationsDrawer({
+  unreadCount: loaderUnreadCount,
+}: NotificationsDrawerProps) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState<NotificationFilter>("all");
   const list = useNotificationList(open, filter);
+  const unreadCount = useNotificationCheck({
+    loaderUnreadCount,
+    shown: open ? list.notifications : null,
+    filter,
+    addNewer: list.addNewer,
+  });
   const markFetcher = useFetcher();
   const markAllFetcher = useFetcher();
   const navigate = useNavigate();
@@ -134,7 +152,12 @@ export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
             Mark all as read
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto">
+        {/* Scroll anchoring is done by hand in `useNotificationList`, the same
+            in every browser, so the browser's own is off. */}
+        <div
+          ref={list.listRef}
+          className="flex-1 overflow-y-auto [overflow-anchor:none]"
+        >
           {list.notifications === null ? (
             <NotificationListSkeleton />
           ) : list.notifications.length === 0 ? (
@@ -189,10 +212,22 @@ type NotificationListState = Omit<NotificationPage, "notifications"> & {
 
 const LOADING: NotificationListState = { notifications: null, hasOlder: false };
 
+type ListResponse = Awaited<ReturnType<typeof notificationsLoader>>;
+
+/** The page in a response, or null if it has none or was loaded for another filter. */
+function pageFor(
+  response: ListResponse | undefined,
+  filter: NotificationFilter
+): NotificationPage | null {
+  if (!response || !("notifications" in response)) return null;
+  return response.filter === filter ? response : null;
+}
+
 /**
  * The drawer's list for the current filter. Every opening, and every switch of
  * filter, loads the newest page afresh; opening marks nothing read. "Load
- * older" appends the next page, by the cursor of the oldest one shown.
+ * older" appends the next page, by the position of the oldest one shown, so
+ * arrivals added to the top don't disturb it.
  *
  * After any mark, React Router reloads each fetcher's last page. Pages are
  * therefore merged by id, never replacing what's shown, and marks change the
@@ -204,6 +239,11 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
   const [state, setState] = useState<NotificationListState>(LOADING);
   const filterRef = useRef(filter);
   filterRef.current = filter;
+  const listRef = useRef<HTMLDivElement>(null);
+  const scrollBeforeArrivals = useRef<{
+    scrollTop: number;
+    scrollHeight: number;
+  } | null>(null);
 
   const { load: loadNewest } = newestFetcher;
   useEffect(() => {
@@ -215,15 +255,16 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
   // Each page is handled once, when it arrives. One loaded for another filter
   // is dropped, and an older page only extends a list already shown.
   useEffect(() => {
-    const page = newestFetcher.data;
-    if (!page || page.filter !== filterRef.current) return;
+    const page = pageFor(newestFetcher.data, filterRef.current);
+    if (!page) return;
+    scrollBeforeArrivals.current = null;
     setState((list) =>
       list.notifications === null ? page : mergePage(shown(list), page)
     );
   }, [newestFetcher.data]);
   useEffect(() => {
-    const page = olderFetcher.data;
-    if (!page || page.filter !== filterRef.current) return;
+    const page = pageFor(olderFetcher.data, filterRef.current);
+    if (!page) return;
     setState((list) =>
       list.notifications === null ? list : mergePage(shown(list), page)
     );
@@ -233,6 +274,54 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
     const oldest = state.notifications?.at(-1);
     if (oldest) void olderFetcher.load(listUrl(filter, oldest));
   }
+
+  /**
+   * Adds Notifications newer than the newest shown to the top of the list.
+   * Someone scrolled down keeps their place; at the very top they see the
+   * arrivals. A full page of them may not meet the rows shown, so it
+   * replaces the list rather than leave a gap.
+   */
+  function addNewer(response: ListResponse) {
+    const page = pageFor(response, filterRef.current);
+    const notifications = state.notifications;
+    if (!page || notifications === null) return;
+    const shownIds = new Set(notifications.map((notification) => notification.id));
+    const arrivals = page.notifications.filter(
+      (notification) => !shownIds.has(notification.id)
+    );
+    if (arrivals.length === 0) return;
+
+    if (page.notifications.length >= PAGE_SIZE) {
+      scrollBeforeArrivals.current = null;
+      setState({
+        notifications: page.notifications,
+        // What was shown is older than all of them.
+        hasOlder: page.hasOlder || notifications.length > 0,
+      });
+      return;
+    }
+
+    const list = listRef.current;
+    scrollBeforeArrivals.current =
+      list && list.scrollTop > 0
+        ? { scrollTop: list.scrollTop, scrollHeight: list.scrollHeight }
+        : null;
+    setState((current) =>
+      current.notifications === null
+        ? current
+        : mergePage(shown(current), { notifications: arrivals, hasOlder: page.hasOlder })
+    );
+  }
+
+  // Shifts the scroll by the height the arrivals added, so the rows the person
+  // is looking at stay where they are.
+  useLayoutEffect(() => {
+    const before = scrollBeforeArrivals.current;
+    const list = listRef.current;
+    scrollBeforeArrivals.current = null;
+    if (!before || !list) return;
+    list.scrollTop = before.scrollTop + (list.scrollHeight - before.scrollHeight);
+  }, [state.notifications]);
 
   function setRead(id: number, read: boolean) {
     setState((list) => ({
@@ -261,8 +350,10 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
     hasOlder: state.hasOlder,
     loadingOlder: olderFetcher.state === "loading",
     loadOlder,
+    addNewer,
     setRead,
     setAllRead,
+    listRef,
   };
 }
 
@@ -270,7 +361,8 @@ function shown({ notifications, hasOlder }: NotificationListState): Notification
   return { notifications: notifications ?? [], hasOlder };
 }
 
-function listUrl(filter: NotificationFilter, before?: NotificationCursor) {
+/** A page of the list for the filter: the newest, or the one before a position. */
+function listUrl(filter: NotificationFilter, before?: NotificationPosition) {
   const params = new URLSearchParams({ filter });
   if (before) {
     params.set("beforeRaisedAt", before.raisedAt);
@@ -280,7 +372,7 @@ function listUrl(filter: NotificationFilter, before?: NotificationCursor) {
 }
 
 /** Newest first, by the (raisedAt, id) pair the server sorts by. */
-function newestFirst(a: NotificationCursor, b: NotificationCursor): number {
+function newestFirst(a: NotificationPosition, b: NotificationPosition): number {
   if (a.raisedAt !== b.raisedAt) return a.raisedAt < b.raisedAt ? 1 : -1;
   return b.id - a.id;
 }
@@ -303,6 +395,118 @@ function mergePage(list: NotificationPage, page: NotificationPage): Notification
     notifications,
     hasOlder: reachesBottom ? page.hasOlder : list.hasOlder,
   };
+}
+
+/** Matches `NOTIFICATIONS_PAGE_SIZE`, the most one request returns. */
+const PAGE_SIZE = 20;
+
+/** How often to check for new Notifications while the tab is visible. */
+const CHECK_INTERVAL_MS = 30_000;
+
+/**
+ * Checks about every 30 seconds, while the tab is visible, for new
+ * Notifications, and returns the unread count for the badge. With the drawer
+ * open, the same check fetches the Notifications newer than the newest shown,
+ * under the current filter, and adds them to the top.
+ *
+ * Arrivals change only the badge: no toast, sound or tab title. The check
+ * loads the notifications endpoint with a fetcher, so the heavy app layout
+ * loader doesn't rerun.
+ */
+function useNotificationCheck({
+  loaderUnreadCount,
+  shown,
+  filter,
+  addNewer,
+}: {
+  loaderUnreadCount: number;
+  /** The drawer's list while it's open and loaded, otherwise null. */
+  shown: NotificationForDisplay[] | null;
+  filter: NotificationFilter;
+  addNewer: (response: ListResponse) => void;
+}): number {
+  const fetcher = useFetcher<typeof notificationsLoader>();
+  const { load } = fetcher;
+  const [unreadCount, setUnreadCount] = useState(loaderUnreadCount);
+
+  // Whichever answered last wins: the layout loader on a page change or after
+  // a mark, or this check.
+  useEffect(() => setUnreadCount(loaderUnreadCount), [loaderUnreadCount]);
+
+  const addNewerRef = useRef(addNewer);
+  useEffect(() => {
+    addNewerRef.current = addNewer;
+  });
+
+  useEffect(() => {
+    if (!fetcher.data) return;
+    setUnreadCount(fetcher.data.unreadCount);
+    addNewerRef.current(fetcher.data);
+  }, [fetcher.data]);
+
+  useVisibleTabInterval(
+    () => void load(notificationCheckUrl(shown, filter)),
+    CHECK_INTERVAL_MS
+  );
+
+  return unreadCount;
+}
+
+/**
+ * The count alone, or with the drawer open, the Notifications under its filter
+ * newer than the newest shown.
+ */
+function notificationCheckUrl(
+  shown: NotificationForDisplay[] | null,
+  filter: NotificationFilter
+): string {
+  if (shown === null) return `${NOTIFICATIONS_ENDPOINT}?only=unread-count`;
+
+  const params = new URLSearchParams({ filter });
+  const newest = shown[0];
+  // An open drawer with nothing in it yet checks the newest page.
+  if (newest) {
+    params.set("newerThanRaisedAt", newest.raisedAt);
+    params.set("newerThanId", String(newest.id));
+  }
+  return `${NOTIFICATIONS_ENDPOINT}?${params}`;
+}
+
+/**
+ * Calls `callback` every `intervalMs` while the tab is visible (Page
+ * Visibility API). Hidden, it stops; visible again, it calls at once and
+ * starts over.
+ */
+function useVisibleTabInterval(callback: () => void, intervalMs: number) {
+  const callbackRef = useRef(callback);
+  useEffect(() => {
+    callbackRef.current = callback;
+  });
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | undefined;
+
+    function start() {
+      clearInterval(timer);
+      timer = setInterval(() => callbackRef.current(), intervalMs);
+    }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        callbackRef.current();
+        start();
+      } else {
+        clearInterval(timer);
+      }
+    }
+
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [intervalMs]);
 }
 
 /** The unread badge: hidden at zero, "9+" above nine. */
