@@ -78,4 +78,52 @@ describe("lesson page comment anchors", () => {
     expect(html).toContain('id="comment-42"');
     expect(html).toContain('id="comment-43"');
   });
+
+  // A Notification about a comment that was later deleted still links to
+  // `#comment-<id>`, so the spot stays in the thread with nothing shown at it.
+  function deleted(id: number, overrides: Partial<RenderedComment> = {}) {
+    return comment(id, { deleted: true, body: "", bodyHtml: "", ...overrides });
+  }
+
+  /** The anchor is there, and empty: nothing shows at it. */
+  function expectEmptyAnchor(html: string, id: number) {
+    expect(html).toMatch(new RegExp(`<div id="comment-${id}"[^>]*></div>`));
+  }
+
+  it("keeps the spot of a deleted reply without showing it", () => {
+    const html = renderLessonThread([
+      comment(42, { replies: [deleted(43), comment(44)] }),
+    ]);
+
+    expectEmptyAnchor(html, 43);
+    expect(html).toContain('id="comment-44"');
+    expect(html).not.toContain("This comment was deleted.");
+  });
+
+  it("keeps the spot of a deleted question with no replies without showing it", () => {
+    const html = renderLessonThread([comment(41), deleted(42), comment(45)]);
+
+    expectEmptyAnchor(html, 42);
+    expect(html).toContain('id="comment-41"');
+    expect(html).toContain('id="comment-45"');
+    expect(html).not.toContain("This comment was deleted.");
+  });
+
+  it("keeps the spots of a deleted question whose replies were all deleted", () => {
+    const html = renderLessonThread([
+      comment(41),
+      deleted(42, { replies: [deleted(43)] }),
+    ]);
+
+    expectEmptyAnchor(html, 42);
+    expectEmptyAnchor(html, 43);
+    expect(html).not.toContain("This comment was deleted.");
+  });
+
+  it("still invites a question when every comment in the thread was deleted", () => {
+    const html = renderLessonThread([deleted(42)]);
+
+    expect(html).toContain("Stuck on this lesson?");
+    expectEmptyAnchor(html, 42);
+  });
 });

@@ -1,5 +1,14 @@
 import Database from "better-sqlite3";
-import { and, eq, gte, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
+import {
+  and,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  sql,
+  type SQL,
+} from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
@@ -16,6 +25,7 @@ import {
   NotificationEventKind,
 } from "../app/db/schema";
 import { notify } from "../app/lib/notifications.server";
+import { approveRefundRequest } from "../app/lib/refunds.server";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1877,6 +1887,27 @@ This course is still in draft while the cluster examples are rewritten against t
     return row;
   }
 
+  // A few comments are posted as a real post is: the comment and its New
+  // question or New reply Notification Event in one transaction, so Sarah and
+  // the Students in those threads have something in their drawers. A reply
+  // raised this way is the last in its thread, since notify() works out who's
+  // in the thread when it's called.
+  function postComment(values: typeof schema.comments.$inferInsert) {
+    return db.transaction((tx) => {
+      const row = tx.insert(schema.comments).values(values).returning().get();
+      notify(tx, {
+        kind:
+          row.parentId === null
+            ? NotificationEventKind.NewQuestion
+            : NotificationEventKind.NewReply,
+        actorId: row.userId,
+        commentId: row.id,
+        raisedAt: new Date(row.createdAt),
+      });
+      return row;
+    });
+  }
+
   // Answered: student asks, Sarah answers, student confirms.
   const c1q1 = comment({
     lessonId: course1LessonIds[2],
@@ -1900,7 +1931,7 @@ This course is still in draft while the cluster examples are rewritten against t
   });
 
   // Waiting, and stale enough to flag amber in the queue.
-  comment({
+  postComment({
     lessonId: course1LessonIds[7],
     userId: students[2].id,
     body: "Why does this fail to infer? I expected `T` to come out as `string`.\n\n```typescript\nfunction first<T>(items: T[]): T {\n  return items[0];\n}\n\nconst x = first([]);\n```",
@@ -1908,7 +1939,7 @@ This course is still in draft while the cluster examples are rewritten against t
   });
 
   // Waiting, but posted today — should look calm in the queue.
-  comment({
+  postComment({
     lessonId: course1LessonIds[4],
     userId: students[4].id,
     body: "Is there a reason to prefer `interface` over `type` here, or is it purely style?",
@@ -1922,7 +1953,7 @@ This course is still in draft while the cluster examples are rewritten against t
     body: "Does strict mode change anything about how this example behaves?",
     createdAt: daysAgo(4),
   });
-  comment({
+  postComment({
     lessonId: course1LessonIds[3],
     userId: students[0].id,
     parentId: c1q4.id,
@@ -1977,7 +2008,7 @@ This course is still in draft while the cluster examples are rewritten against t
     body: "Are the example requests in this lesson hitting a real API, or is it all mocked?",
     createdAt: daysAgo(14),
   });
-  comment({
+  postComment({
     lessonId: course2LessonIds[0],
     userId: admin.id,
     parentId: c2q2.id,
@@ -2340,21 +2371,31 @@ This course is still in draft while the cluster examples are rewritten against t
   // the students array — position would silently re-point these redemptions at
   // different people the moment a student is inserted rather than appended.
   // Both already have an enrolment for course 2 from the enrolments section.
-  db.update(schema.coupons)
-    .set({
-      redeemedByUserId: studentByEmail("olivia.martinez@student.dev").id,
-      redeemedAt: daysAgo(30),
-    })
-    .where(eq(schema.coupons.id, seededCoupons[0].id))
-    .run();
+  // Each claim raises its Seat claimed Notification Event for Bossy, the Team
+  // Admin who bought the Team Licence, as a real claim does.
+  function claimSeat(
+    seat: typeof schema.coupons.$inferSelect,
+    studentEmail: string,
+    redeemedAt: string
+  ) {
+    const student = studentByEmail(studentEmail);
+    db.transaction((tx) => {
+      tx.update(schema.coupons)
+        .set({ redeemedByUserId: student.id, redeemedAt })
+        .where(eq(schema.coupons.id, seat.id))
+        .run();
 
-  db.update(schema.coupons)
-    .set({
-      redeemedByUserId: studentByEmail("liam@example.com").id,
-      redeemedAt: daysAgo(25),
-    })
-    .where(eq(schema.coupons.id, seededCoupons[1].id))
-    .run();
+      notify(tx, {
+        kind: NotificationEventKind.SeatClaimed,
+        actorId: student.id,
+        seatId: seat.id,
+        raisedAt: new Date(redeemedAt),
+      });
+    });
+  }
+
+  claimSeat(seededCoupons[0], "olivia.martinez@student.dev", daysAgo(30));
+  claimSeat(seededCoupons[1], "liam@example.com", daysAgo(25));
 
   console.log(
     `Created 1 team with Bossy McBossface as admin, 1 team purchase, and ${seededCoupons.length} coupons (${countRows(schema.coupons, isNotNull(schema.coupons.redeemedByUserId))} redeemed, ${countRows(schema.coupons, isNull(schema.coupons.redeemedByUserId))} available).`
@@ -2781,7 +2822,7 @@ This course is still in draft while the cluster examples are rewritten against t
     reason: string,
     requestedAt: string
   ) {
-    db.transaction((tx) => {
+    return db.transaction((tx) => {
       const refundRequest = tx
         .insert(schema.refunds)
         .values({
@@ -2799,6 +2840,8 @@ This course is still in draft while the cluster examples are rewritten against t
         refundRequestId: refundRequest.id,
         raisedAt: new Date(requestedAt),
       });
+
+      return refundRequest;
     });
   }
 
@@ -2923,8 +2966,56 @@ This course is still in draft while the cluster examples are rewritten against t
     daysAgo(5)
   );
 
+  // ─── An approved Refund Request ───
+  // James bought Design Systems with Tailwind, thought better of it within
+  // the window, and a Platform Admin approved his request. It goes through
+  // approveRefundRequest, as a real approval does: it ends his Enrollment and
+  // raises the Notification Event that tells him.
+
+  const [jamesTailwindPurchase] = db
+    .insert(schema.purchases)
+    .values({
+      userId: studentByEmail("james.park@student.dev").id,
+      courseId: course3.id,
+      amountPaid: course3.price,
+      country: "US",
+      createdAt: daysAgo(5),
+    })
+    .returning()
+    .all();
+  db.insert(schema.enrollments)
+    .values({
+      userId: jamesTailwindPurchase.userId,
+      courseId: course3.id,
+      enrolledAt: daysAgo(5),
+    })
+    .run();
+
+  const jamesRefundRequest = seedOpenRefundRequest(
+    jamesTailwindPurchase,
+    "I meant to buy this for a colleague, not for me.",
+    daysAgo(3)
+  );
+  const approval = approveRefundRequest(
+    db,
+    jamesRefundRequest.id,
+    admin.id,
+    null,
+    new Date(hoursAgo(40))
+  );
+  if (!approval.ok) {
+    throw new Error(`Seeding James's approval failed: ${approval.error}`);
+  }
+
   console.log(
-    `Created ${countRows(schema.notifications)} Notifications for raised and declined Refund Requests.`
+    `Created ${countRows(
+      schema.notifications,
+      inArray(schema.notifications.kind, [
+        NotificationEventKind.RefundRequestRaised,
+        NotificationEventKind.RefundRequestApproved,
+        NotificationEventKind.RefundRequestDeclined,
+      ])
+    )} Notifications for raised, approved and declined Refund Requests.`
   );
 
   // ─── Flush watch events ───
