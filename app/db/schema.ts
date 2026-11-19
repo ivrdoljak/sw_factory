@@ -42,6 +42,17 @@ export enum TeamMemberRole {
   Member = "member",
 }
 
+// The Notification Events that raise Notifications (spec #18). An event not on
+// this list raises nothing.
+export enum NotificationEventKind {
+  RefundRequestApproved = "refund_request_approved",
+  RefundRequestDeclined = "refund_request_declined",
+  RefundRequestRaised = "refund_request_raised",
+  SeatClaimed = "seat_claimed",
+  NewQuestion = "new_question",
+  NewReply = "new_reply",
+}
+
 // ─── Tables ───
 
 export const users = sqliteTable("users", {
@@ -357,6 +368,45 @@ export const comments = sqliteTable(
   (table) => [
     index("comments_lesson_idx").on(table.lessonId),
     index("comments_parent_idx").on(table.parentId),
+  ]
+);
+
+// One Notification per recipient. It holds references to what is involved, not
+// rendered text: titles, links and detail are built when shown, from current
+// data (docs/adr/0013). Read and written only by app/lib/notifications.server.ts.
+export const notifications = sqliteTable(
+  "notifications",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    recipientId: integer("recipient_id")
+      .notNull()
+      .references(() => users.id),
+    kind: text("kind").notNull().$type<NotificationEventKind>(),
+    // The person who acted. Null when nobody did.
+    actorId: integer("actor_id").references(() => users.id),
+    // What is involved. Which of these are set depends on the kind.
+    courseId: integer("course_id").references(() => courses.id),
+    lessonId: integer("lesson_id").references(() => lessons.id),
+    commentId: integer("comment_id").references(() => comments.id),
+    refundRequestId: integer("refund_request_id").references(() => refunds.id),
+    // An Individual Purchase. A Team Licence goes in teamLicenceId instead.
+    purchaseId: integer("purchase_id").references(() => purchases.id),
+    // A Team Licence is a Purchase that granted Seats; there is no table of its own.
+    teamLicenceId: integer("team_licence_id").references(() => purchases.id),
+    raisedAt: text("raised_at").notNull(),
+    // Null while unread.
+    readAt: text("read_at"),
+  },
+  (table) => [
+    index("notifications_recipient_raised_idx").on(
+      table.recipientId,
+      table.raisedAt,
+      table.id
+    ),
+    index("notifications_recipient_read_idx").on(
+      table.recipientId,
+      table.readAt
+    ),
   ]
 );
 

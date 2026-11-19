@@ -4,6 +4,7 @@ import { cn } from "~/lib/utils";
 import { UserRole } from "~/db/schema";
 import { UserAvatar } from "~/components/user-avatar";
 import {
+  Bell,
   BookOpen,
   ChartColumn,
   LayoutDashboard,
@@ -41,6 +42,7 @@ interface SidebarProps {
   currentUser: CurrentUser | null;
   recentCourses?: RecentCourse[];
   isTeamAdmin?: boolean;
+  unreadNotificationCount?: number;
 }
 
 interface NavItem {
@@ -107,6 +109,35 @@ const navItems: NavItem[] = [
   },
 ];
 
+/** The unread badge's label: hidden at zero, "9+" above nine. */
+function unreadBadgeLabel(count: number): string | null {
+  if (count <= 0) return null;
+  return count > 9 ? "9+" : String(count);
+}
+
+function NotificationsRow({ unreadCount }: { unreadCount: number }) {
+  const badge = unreadBadgeLabel(unreadCount);
+
+  // Opening the drawer comes with a later ticket; for now the row does nothing.
+  return (
+    <button
+      type="button"
+      className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+    >
+      <Bell className="size-4" />
+      <span className="flex-1 text-left">Notifications</span>
+      {badge && (
+        <span
+          aria-label={`${unreadCount} unread`}
+          className="inline-flex min-w-5 items-center justify-center rounded-full bg-red-600 px-1.5 text-[11px] font-semibold leading-5 text-white"
+        >
+          {badge}
+        </span>
+      )}
+    </button>
+  );
+}
+
 function isVisible(item: NavItem, role: UserRole | null): boolean {
   if (item.roles === "all") return true;
   if (!role) return false;
@@ -117,6 +148,7 @@ export function Sidebar({
   currentUser,
   recentCourses = [],
   isTeamAdmin = false,
+  unreadNotificationCount = 0,
 }: SidebarProps) {
   const currentUserRole = currentUser?.role ?? null;
   const [isDark, setIsDark] = useState(false);
@@ -143,6 +175,9 @@ export function Sidebar({
       </div>
 
       <nav className="flex-1 space-y-1 p-3">
+        {currentUser && (
+          <NotificationsRow unreadCount={unreadNotificationCount} />
+        )}
         {navItems
           .filter((item) => isVisible(item, currentUserRole))
           .map((item) => (

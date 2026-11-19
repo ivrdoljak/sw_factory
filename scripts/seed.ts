@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { eq, gte, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
+import { and, eq, gte, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { SQLiteTable } from "drizzle-orm/sqlite-core";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
@@ -13,7 +13,9 @@ import {
   RefundStatus,
   QuestionType,
   TeamMemberRole,
+  NotificationEventKind,
 } from "../app/db/schema";
+import { notify } from "../app/lib/notifications.server";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -65,6 +67,7 @@ async function seed() {
 
   // Drop and recreate tables for a clean seed
   sqlite.exec(`
+    DROP TABLE IF EXISTS notifications;
     DROP TABLE IF EXISTS comments;
     DROP TABLE IF EXISTS course_ratings;
     DROP TABLE IF EXISTS video_watch_events;
@@ -2798,6 +2801,104 @@ This course is still in draft while the cluster examples are rewritten against t
 
   console.log("Created Marta's Refund Request on her Team Licence.");
 
+  // ─── Declined Refund Requests and their Notifications ───
+  // Declined, because a decline takes nothing away from the buyer. Each one
+  // raises its Notification through notify(), as a real decision does, so
+  // switching to Emma, James, Sophia or Bossy in DevUI shows an unread badge.
+
+  function seedDeclinedRefundRequest(
+    buyerEmail: string,
+    courseId: number,
+    reason: string,
+    decisionNote: string,
+    requestedAt: string,
+    decidedAt: string
+  ) {
+    const buyer =
+      buyerEmail === bossy.email ? bossy : studentByEmail(buyerEmail);
+    const purchase = db
+      .select()
+      .from(schema.purchases)
+      .where(
+        and(
+          eq(schema.purchases.userId, buyer.id),
+          eq(schema.purchases.courseId, courseId)
+        )
+      )
+      .get();
+    if (!purchase) {
+      throw new Error(`${buyerEmail} has no Purchase of course ${courseId}.`);
+    }
+
+    db.transaction((tx) => {
+      const refundRequest = tx
+        .insert(schema.refunds)
+        .values({
+          purchaseId: purchase.id,
+          status: RefundStatus.Declined,
+          reason,
+          requestedAt,
+          resolvedAt: decidedAt,
+          resolvedByUserId: admin.id,
+          decisionNote,
+        })
+        .returning()
+        .get();
+
+      notify(tx, {
+        kind: NotificationEventKind.RefundRequestDeclined,
+        actorId: admin.id,
+        refundRequestId: refundRequest.id,
+        raisedAt: new Date(decidedAt),
+      });
+    });
+  }
+
+  seedDeclinedRefundRequest(
+    "emma.wilson@student.dev",
+    course2.id,
+    "I thought this covered GraphQL as well.",
+    "The course page lists what it covers, and GraphQL isn't on it. You're past the 14-day window too.",
+    daysAgo(39),
+    daysAgo(38)
+  );
+  seedDeclinedRefundRequest(
+    "emma.wilson@student.dev",
+    course2.id,
+    "Still not what I needed.",
+    "Same answer as before, sorry: the window closed weeks ago.",
+    daysAgo(3),
+    hoursAgo(20)
+  );
+  seedDeclinedRefundRequest(
+    "james.park@student.dev",
+    course1.id,
+    "Too basic for me.",
+    "The 14-day window closed about a month ago, so this one can't be refunded.",
+    daysAgo(2),
+    hoursAgo(30)
+  );
+  seedDeclinedRefundRequest(
+    "sophia.davis@student.dev",
+    course1.id,
+    "My employer is paying for a different course.",
+    "Your 14-day window closed the day before you asked, so we can't refund this one.",
+    hoursAgo(12),
+    hoursAgo(3)
+  );
+  seedDeclinedRefundRequest(
+    bossy.email,
+    course2.id,
+    "Half the team left.",
+    "Two Seats on this Team Licence have been claimed, so it can't be refunded.",
+    daysAgo(6),
+    daysAgo(5)
+  );
+
+  console.log(
+    `Created ${countRows(schema.notifications)} Notifications for declined Refund Requests.`
+  );
+
   // ─── Flush watch events ───
   // Batched: the heartbeat makes these by far the largest table, and one
   // statement per row would dominate the seed's runtime.
@@ -2840,6 +2941,9 @@ This course is still in draft while the cluster examples are rewritten against t
   console.log(`  Enrollments: ${countRows(schema.enrollments)}`);
   console.log(`  Course ratings: ${countRows(schema.courseRatings)}`);
   console.log(`  Lesson comments: ${countRows(schema.comments)}`);
+  console.log(
+    `  Notifications: ${countRows(schema.notifications)} (${countRows(schema.notifications, isNull(schema.notifications.readAt))} unread)`
+  );
   console.log(
     `  Lesson progress: ${countRows(schema.lessonProgress)} (${countRows(schema.lessonProgress, eq(schema.lessonProgress.status, LessonProgressStatus.Completed))} completed)`
   );
