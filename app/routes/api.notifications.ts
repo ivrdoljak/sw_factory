@@ -9,8 +9,12 @@ import {
   markAllRead,
   markRead,
   markUnread,
-  type NotificationPosition,
 } from "~/lib/notifications.server";
+import {
+  decodeNotificationPosition,
+  MarkIntent,
+  NOTIFICATION_FILTERS,
+} from "~/lib/notifications";
 import { parseFormData } from "~/lib/validation";
 
 // The one endpoint for the current user's Notifications (spec #18). Later
@@ -22,37 +26,27 @@ import { parseFormData } from "~/lib/validation";
 // - POST: the mark actions, one `intent` each in `actionSchema`. Posting from a
 //   fetcher revalidates the layout loader, so the sidebar badge refreshes.
 
-const listSchema = z
-  .object({
-    filter: z.enum(["all", "unread"]).default("all"),
-    // "Load older": the oldest Notification shown, as its (raisedAt, id) pair.
-    beforeRaisedAt: z.string().datetime().optional(),
-    beforeId: z.coerce.number().int().positive().optional(),
-    // The polling check: just the unread count, for the badge.
-    only: z.literal("unread-count").optional(),
-    // The polling check with the drawer open: only Notifications raised after
-    // the newest one shown, given as its (raisedAt, id) position.
-    newerThanRaisedAt: z.string().datetime().optional(),
-    newerThanId: z.coerce.number().int().positive().optional(),
-  })
-  .refine(
-    (query) =>
-      (query.beforeRaisedAt === undefined) === (query.beforeId === undefined),
-    "beforeRaisedAt and beforeId go together"
-  )
-  .refine(
-    (query) =>
-      (query.newerThanRaisedAt === undefined) ===
-      (query.newerThanId === undefined),
-    "newerThanRaisedAt and newerThanId go together"
+/** A Notification's (raisedAt, id) position, as `encodeNotificationPosition` wrote it. */
+const position = z
+  .string()
+  .transform(decodeNotificationPosition)
+  .pipe(
+    z.object({
+      raisedAt: z.string().datetime(),
+      id: z.number().int().positive(),
+    })
   );
 
-function position(
-  raisedAt: string | undefined,
-  id: number | undefined
-): NotificationPosition | undefined {
-  return raisedAt !== undefined && id !== undefined ? { raisedAt, id } : undefined;
-}
+const listSchema = z.object({
+  filter: z.enum(NOTIFICATION_FILTERS).default("all"),
+  // "Load older": only Notifications older than the oldest one shown.
+  before: position.optional(),
+  // The polling check: just the unread count, for the badge.
+  only: z.literal("unread-count").optional(),
+  // The polling check with the drawer open: only Notifications raised after
+  // the newest one shown.
+  newerThan: position.optional(),
+});
 
 export async function loader({ request, url }: Route.LoaderArgs) {
   const userId = await requireUserId(request);
@@ -66,8 +60,8 @@ export async function loader({ request, url }: Route.LoaderArgs) {
 
   const page = listNotificationPage(db, userId, {
     filter: query.filter,
-    before: position(query.beforeRaisedAt, query.beforeId),
-    newerThan: position(query.newerThanRaisedAt, query.newerThanId),
+    before: query.before,
+    newerThan: query.newerThan,
   });
 
   // The filter is echoed so the drawer can drop a page meant for another one.
@@ -77,9 +71,9 @@ export async function loader({ request, url }: Route.LoaderArgs) {
 const notificationId = z.coerce.number().int().positive();
 
 const actionSchema = z.discriminatedUnion("intent", [
-  z.object({ intent: z.literal("mark-read"), notificationId }),
-  z.object({ intent: z.literal("mark-unread"), notificationId }),
-  z.object({ intent: z.literal("mark-all-read") }),
+  z.object({ intent: z.literal(MarkIntent.Read), notificationId }),
+  z.object({ intent: z.literal(MarkIntent.Unread), notificationId }),
+  z.object({ intent: z.literal(MarkIntent.AllRead) }),
 ]);
 
 export async function action({ request }: Route.ActionArgs) {
@@ -89,19 +83,19 @@ export async function action({ request }: Route.ActionArgs) {
   if (!parsed.success) throw data("Invalid Notification action", { status: 400 });
 
   switch (parsed.data.intent) {
-    case "mark-read": {
+    case MarkIntent.Read: {
       if (!markRead(db, userId, parsed.data.notificationId)) {
         throw data("Notification not found", { status: 404 });
       }
       return { ok: true };
     }
-    case "mark-unread": {
+    case MarkIntent.Unread: {
       if (!markUnread(db, userId, parsed.data.notificationId)) {
         throw data("Notification not found", { status: 404 });
       }
       return { ok: true };
     }
-    case "mark-all-read": {
+    case MarkIntent.AllRead: {
       markAllRead(db, userId);
       return { ok: true };
     }

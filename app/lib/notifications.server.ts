@@ -17,6 +17,11 @@ import {
 import type { Queryable, Tx } from "~/db/types";
 import { commentExcerpt } from "~/lib/comment-markdown.server";
 import { commentAnchorId } from "~/lib/comments";
+import {
+  NOTIFICATIONS_PAGE_SIZE,
+  type NotificationFilter,
+  type NotificationPosition,
+} from "~/lib/notifications";
 
 // ─── Notifications ───
 // The only code that reads or writes Notifications (docs/adr/0013, spec #18).
@@ -345,19 +350,6 @@ function selectNotifications(db: Queryable) {
 type NotificationRow = ReturnType<
   ReturnType<typeof selectNotifications>["all"]
 >[number];
-
-/** How many Notifications the drawer loads at a time. */
-export const NOTIFICATIONS_PAGE_SIZE = 20;
-
-/** The drawer's filters: every Notification, or only the unread ones. */
-export type NotificationFilter = "all" | "unread";
-
-/**
- * Where a Notification sits in the list: the (raisedAt, id) pair it's sorted
- * by. Not the id alone, since `raisedAt` comes from the event and doesn't
- * follow insertion order.
- */
-export type NotificationPosition = Pick<NotificationForDisplay, "raisedAt" | "id">;
 
 /** Which of the recipient's Notifications to list. */
 export type NotificationListQuery = {

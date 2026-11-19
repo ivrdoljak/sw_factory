@@ -18,11 +18,17 @@ import {
 } from "lucide-react";
 import { NotificationEventKind, RefundStatus } from "~/db/schema";
 import type {
-  NotificationFilter,
   NotificationForDisplay,
   NotificationPage,
-  NotificationPosition,
 } from "~/lib/notifications.server";
+import {
+  encodeNotificationPosition,
+  MarkIntent,
+  NOTIFICATION_FILTERS,
+  NOTIFICATIONS_PAGE_SIZE,
+  type NotificationFilter,
+  type NotificationPosition,
+} from "~/lib/notifications";
 import type { loader as notificationsLoader } from "~/routes/api.notifications";
 import { cn, formatRelativeTime } from "~/lib/utils";
 import { Button } from "~/components/ui/button";
@@ -42,10 +48,10 @@ import {
 
 const NOTIFICATIONS_ENDPOINT = "/api/notifications";
 
-const FILTERS: { value: NotificationFilter; label: string }[] = [
-  { value: "all", label: "All" },
-  { value: "unread", label: "Unread" },
-];
+const FILTER_LABELS: Record<NotificationFilter, string> = {
+  all: "All",
+  unread: "Unread",
+};
 
 type NotificationsDrawerProps = {
   /** The count from the app layout loader, fresh on every page change. */
@@ -91,7 +97,7 @@ export function NotificationsDrawer({
     if (!notification.read) {
       list.setRead(notification.id, true);
       await markFetcher.submit(
-        { intent: "mark-read", notificationId: notification.id },
+        { intent: MarkIntent.Read, notificationId: notification.id },
         { method: "post", action: NOTIFICATIONS_ENDPOINT }
       );
     }
@@ -101,7 +107,7 @@ export function NotificationsDrawer({
   function markAllRead() {
     list.setAllRead();
     void markAllFetcher.submit(
-      { intent: "mark-all-read" },
+      { intent: MarkIntent.AllRead },
       { method: "post", action: NOTIFICATIONS_ENDPOINT }
     );
   }
@@ -126,7 +132,7 @@ export function NotificationsDrawer({
           </DrawerDescription>
         </DrawerHeader>
         <div className="flex items-center gap-1 border-b px-5 py-2">
-          {FILTERS.map(({ value, label }) => (
+          {NOTIFICATION_FILTERS.map((value) => (
             <button
               key={value}
               type="button"
@@ -139,7 +145,9 @@ export function NotificationsDrawer({
                   : "hover:bg-accent"
               )}
             >
-              {value === "unread" ? `${label} (${unreadCount})` : label}
+              {value === "unread"
+                ? `${FILTER_LABELS[value]} (${unreadCount})`
+                : FILTER_LABELS[value]}
             </button>
           ))}
           <button
@@ -298,7 +306,7 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
     );
     if (arrivals.length === 0) return;
 
-    if (page.notifications.length >= PAGE_SIZE) {
+    if (page.notifications.length >= NOTIFICATIONS_PAGE_SIZE) {
       scrollBeforeArrivals.current = null;
       setState({
         notifications: page.notifications,
@@ -371,10 +379,7 @@ function shown({ notifications, hasOlder }: NotificationListState): Notification
 /** A page of the list for the filter: the newest, or the one before a position. */
 function listUrl(filter: NotificationFilter, before?: NotificationPosition) {
   const params = new URLSearchParams({ filter });
-  if (before) {
-    params.set("beforeRaisedAt", before.raisedAt);
-    params.set("beforeId", String(before.id));
-  }
+  if (before) params.set("before", encodeNotificationPosition(before));
   return `${NOTIFICATIONS_ENDPOINT}?${params}`;
 }
 
@@ -403,9 +408,6 @@ function mergePage(list: NotificationPage, page: NotificationPage): Notification
     hasOlder: reachesBottom ? page.hasOlder : list.hasOlder,
   };
 }
-
-/** Matches `NOTIFICATIONS_PAGE_SIZE`, the most one request returns. */
-const PAGE_SIZE = 20;
 
 /** How often to check for new Notifications while the tab is visible. */
 const CHECK_INTERVAL_MS = 30_000;
@@ -472,10 +474,7 @@ function notificationCheckUrl(
   const params = new URLSearchParams({ filter });
   const newest = shown[0];
   // An open drawer with nothing in it yet checks the newest page.
-  if (newest) {
-    params.set("newerThanRaisedAt", newest.raisedAt);
-    params.set("newerThanId", String(newest.id));
-  }
+  if (newest) params.set("newerThan", encodeNotificationPosition(newest));
   return `${NOTIFICATIONS_ENDPOINT}?${params}`;
 }
 
@@ -615,7 +614,7 @@ function NotificationRow({
     onMarked(unread);
     void markFetcher.submit(
       {
-        intent: unread ? "mark-read" : "mark-unread",
+        intent: unread ? MarkIntent.Read : MarkIntent.Unread,
         notificationId: notification.id,
       },
       { method: "post", action: NOTIFICATIONS_ENDPOINT }
