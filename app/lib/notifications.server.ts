@@ -48,6 +48,14 @@ type RefundDecisionEvent = {
   raisedAt: Date;
 };
 
+type SeatClaimedEvent = {
+  kind: NotificationEventKind.SeatClaimed;
+  /** The Student who claimed the Seat. */
+  actorId: number;
+  seatId: number;
+  raisedAt: Date;
+};
+
 type NewQuestionEvent = {
   kind: NotificationEventKind.NewQuestion;
   /** Whoever asked: the author of the top-level comment. */
@@ -57,7 +65,10 @@ type NewQuestionEvent = {
 };
 
 /** A Notification Event with its facts: which kind, who acted, and the ids involved. */
-export type NotificationEvent = RefundDecisionEvent | NewQuestionEvent;
+export type NotificationEvent =
+  | RefundDecisionEvent
+  | SeatClaimedEvent
+  | NewQuestionEvent;
 
 // ─── Write side ───
 
@@ -108,6 +119,8 @@ function findDelivery(tx: Tx, event: NotificationEvent): Delivery {
       return refundDecisionDelivery(tx, event);
     case NotificationEventKind.RefundRequestDeclined:
       return refundDecisionDelivery(tx, event);
+    case NotificationEventKind.SeatClaimed:
+      return seatClaimedDelivery(tx, event);
     case NotificationEventKind.NewQuestion:
       return newQuestionDelivery(tx, event);
   }
@@ -144,6 +157,27 @@ function refundDecisionDelivery(
       ...(isTeamLicence
         ? { teamLicenceId: purchase.id }
         : { purchaseId: purchase.id }),
+    },
+  };
+}
+
+/** A claimed Seat goes to the Team Admin who bought its Team Licence. */
+function seatClaimedDelivery(tx: Tx, event: SeatClaimedEvent): Delivery {
+  const found = tx
+    .select({ teamLicence: purchases })
+    .from(coupons)
+    .innerJoin(purchases, eq(coupons.purchaseId, purchases.id))
+    .where(eq(coupons.id, event.seatId))
+    .get();
+
+  if (!found) return NOBODY;
+
+  const { teamLicence } = found;
+  return {
+    recipientIds: [teamLicence.userId],
+    references: {
+      courseId: teamLicence.courseId,
+      teamLicenceId: teamLicence.id,
     },
   };
 }
@@ -277,11 +311,12 @@ function renderKind(row: NotificationRow): Rendered | null {
       return renderRefundRequestApproved(row);
     case NotificationEventKind.RefundRequestDeclined:
       return renderRefundRequestDeclined(row);
+    case NotificationEventKind.SeatClaimed:
+      return renderSeatClaimed(row);
     case NotificationEventKind.NewQuestion:
       return renderNewQuestion(row);
     // Not raised yet: each gets its renderer with the ticket that raises it.
     case NotificationEventKind.RefundRequestRaised:
-    case NotificationEventKind.SeatClaimed:
     case NotificationEventKind.NewReply:
       return null;
   }
@@ -304,6 +339,19 @@ function renderRefundRequestDeclined(row: NotificationRow): Rendered {
     detail: row.refundRequest?.decisionNote ?? null,
     refundStatus: null,
   };
+}
+
+function renderSeatClaimed(row: NotificationRow): Rendered {
+  return {
+    title: `${actorName(row)} claimed a Seat on ${courseTitle(row)}`,
+    link: "/team",
+    detail: null,
+    refundStatus: null,
+  };
+}
+
+function actorName(row: NotificationRow): string {
+  return row.actor?.name ?? "Someone";
 }
 
 function courseTitle(row: NotificationRow): string {
@@ -334,10 +382,6 @@ function commentDetail(row: NotificationRow): string {
     return "This comment was deleted.";
   }
   return commentExcerpt(row.comment.body);
-}
-
-function actorName(row: NotificationRow): string {
-  return row.actor?.name ?? "Someone";
 }
 
 function lessonTitle(row: NotificationRow): string {
