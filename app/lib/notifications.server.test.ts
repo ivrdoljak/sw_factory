@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { eq } from "drizzle-orm";
 import { createTestDb, seedBaseData } from "~/test/setup";
 import * as schema from "~/db/schema";
 import { NotificationEventKind, RefundStatus, UserRole } from "~/db/schema";
@@ -94,5 +95,123 @@ describe("a recipient's Notifications", () => {
       { raisedAt: yesterday.toISOString() },
     ]);
     expect(countUnread(db, base.user.id)).toBe(2);
+  });
+});
+
+describe("a claimed Seat", () => {
+  function addPerson(name: string) {
+    return db
+      .insert(schema.users)
+      .values({
+        name,
+        email: `${name.toLowerCase().replaceAll(" ", ".")}@example.com`,
+        role: UserRole.Student,
+      })
+      .returning()
+      .get();
+  }
+
+  /** A Team Licence on the base course. Returns its Seats' ids. */
+  function buySeats(teamAdminId: number, seats = 2) {
+    const team = db.insert(schema.teams).values({}).returning().get();
+    const teamLicence = db
+      .insert(schema.purchases)
+      .values({
+        userId: teamAdminId,
+        courseId: base.course.id,
+        amountPaid: 7900 * seats,
+      })
+      .returning()
+      .get();
+    return Array.from(
+      { length: seats },
+      (_, i) =>
+        db
+          .insert(schema.coupons)
+          .values({
+            teamId: team.id,
+            courseId: base.course.id,
+            code: `SEAT-${teamLicence.id}-${i}`,
+            purchaseId: teamLicence.id,
+          })
+          .returning()
+          .get().id
+    );
+  }
+
+  function seatClaimed(seatId: number, studentId: number) {
+    return {
+      kind: NotificationEventKind.SeatClaimed,
+      actorId: studentId,
+      seatId,
+      raisedAt: NOW,
+    } as const;
+  }
+
+  it("notifies the Team Admin who bought the Team Licence, linking to the Team page", () => {
+    const teamAdmin = addPerson("Bossy McBossface");
+    const [seatId] = buySeats(teamAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, seatClaimed(seatId, base.user.id));
+    });
+
+    expect(listNotifications(db, teamAdmin.id)).toEqual([
+      {
+        id: expect.any(Number),
+        kind: NotificationEventKind.SeatClaimed,
+        title: "Test User claimed a Seat on Test Course",
+        link: "/team",
+        detail: null,
+        refundStatus: null,
+        raisedAt: NOW.toISOString(),
+        read: false,
+      },
+    ]);
+    expect(countUnread(db, teamAdmin.id)).toBe(1);
+  });
+
+  it("notifies only that Team Admin, not the Student who claimed it", () => {
+    const teamAdmin = addPerson("Bossy McBossface");
+    const otherTeamAdmin = addPerson("Other Boss");
+    const [seatId] = buySeats(teamAdmin.id);
+    buySeats(otherTeamAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, seatClaimed(seatId, base.user.id));
+    });
+
+    expect(listNotifications(db, base.user.id)).toEqual([]);
+    expect(listNotifications(db, otherTeamAdmin.id)).toEqual([]);
+    expect(countUnread(db, otherTeamAdmin.id)).toBe(0);
+  });
+
+  it("doesn't notify a Team Admin who claims a Seat on their own Team Licence", () => {
+    const teamAdmin = addPerson("Bossy McBossface");
+    const [seatId] = buySeats(teamAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, seatClaimed(seatId, teamAdmin.id));
+    });
+
+    expect(listNotifications(db, teamAdmin.id)).toEqual([]);
+    expect(countUnread(db, teamAdmin.id)).toBe(0);
+  });
+
+  it("shows the course's current title after a rename", () => {
+    const teamAdmin = addPerson("Bossy McBossface");
+    const [seatId] = buySeats(teamAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, seatClaimed(seatId, base.user.id));
+    });
+    db.update(schema.courses)
+      .set({ title: "What is TypeScript?" })
+      .where(eq(schema.courses.id, base.course.id))
+      .run();
+
+    expect(listNotifications(db, teamAdmin.id)).toMatchObject([
+      { title: "Test User claimed a Seat on What is TypeScript?" },
+    ]);
   });
 });
