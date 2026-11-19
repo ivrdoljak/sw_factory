@@ -32,6 +32,7 @@ export const NOTIFICATION_VARIANTS: PrototypeVariant[] = [
   { key: "A", name: "Sidebar bell → popover" },
   { key: "B", name: "New top bar → slide-over drawer" },
   { key: "C", name: "Sidebar Inbox → full inbox view" },
+  { key: "D", name: "Sidebar row (A) → drawer (B)" },
 ];
 
 const eventIcon: Record<ProtoNotificationEvent, React.ReactNode> = {
@@ -170,7 +171,13 @@ function VariantASidebar({ store }: { store: Store }) {
 
 // ─── Variant B: new top bar + right-hand drawer, grouped by day ───
 
-function VariantBTopBar({ store }: { store: Store }) {
+function NotificationDrawer({
+  store,
+  trigger,
+}: {
+  store: Store;
+  trigger: React.ReactNode;
+}) {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState<"all" | "unread">("all");
@@ -187,17 +194,8 @@ function VariantBTopBar({ store }: { store: Store }) {
   }, [shown]);
 
   return (
-    <header className="flex h-14 shrink-0 items-center justify-end gap-2 border-b bg-background px-6">
-      <span className="mr-auto text-xs text-muted-foreground">
-        (This top bar is new; Cadence has none today.)
-      </span>
       <Dialog.Root open={open} onOpenChange={setOpen}>
-        <Dialog.Trigger asChild>
-          <button className="relative rounded-full p-2 hover:bg-accent" title="Notifications">
-            <Bell className="size-5" />
-            <UnreadBadge count={store.unread} className="absolute -right-0.5 -top-0.5" />
-          </button>
-        </Dialog.Trigger>
+        <Dialog.Trigger asChild>{trigger}</Dialog.Trigger>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 z-40 bg-black/30" />
           <Dialog.Content className="fixed inset-y-0 right-0 z-50 flex w-[440px] flex-col border-l bg-background shadow-2xl">
@@ -287,7 +285,42 @@ function VariantBTopBar({ store }: { store: Store }) {
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+  );
+}
+
+function VariantBTopBar({ store }: { store: Store }) {
+  return (
+    <header className="flex h-14 shrink-0 items-center justify-end gap-2 border-b bg-background px-6">
+      <span className="mr-auto text-xs text-muted-foreground">
+        (This top bar is new; Cadence has none today.)
+      </span>
+      <NotificationDrawer
+        store={store}
+        trigger={
+          <button className="relative rounded-full p-2 hover:bg-accent" title="Notifications">
+            <Bell className="size-5" />
+            <UnreadBadge count={store.unread} className="absolute -right-0.5 -top-0.5" />
+          </button>
+        }
+      />
     </header>
+  );
+}
+
+// ─── Variant D: the user's pick — A's sidebar row opens B's drawer ───
+
+function VariantDSidebar({ store }: { store: Store }) {
+  return (
+    <NotificationDrawer
+      store={store}
+      trigger={
+        <button className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground data-[state=open]:bg-sidebar-accent">
+          <Bell className="size-4" />
+          <span className="flex-1 text-left">Notifications</span>
+          <UnreadBadge count={store.unread} />
+        </button>
+      }
+    />
   );
 }
 
@@ -430,6 +463,8 @@ export function useNotificationsPrototype(
   const sidebarSlot =
     variant.key === "A" ? (
       <VariantASidebar store={store} />
+    ) : variant.key === "D" ? (
+      <VariantDSidebar store={store} />
     ) : variant.key === "C" ? (
       <VariantCSidebar store={store} open={inboxOpen} setOpen={setInboxOpen} />
     ) : null;
