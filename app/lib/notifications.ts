@@ -3,6 +3,9 @@
 // this file, so it must never import the database (~/db) or a .server module.
 // The Notifications themselves live in ~/lib/notifications.server.
 
+/** The one endpoint for the current user's Notifications (app/routes/api.notifications.ts). */
+export const NOTIFICATIONS_ENDPOINT = "/api/notifications";
+
 /** How many Notifications the drawer loads at a time: the most one request returns. */
 export const NOTIFICATIONS_PAGE_SIZE = 20;
 
