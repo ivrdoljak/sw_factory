@@ -2775,14 +2775,38 @@ This course is still in draft while the cluster examples are rewritten against t
       updatedAt: daysAgo(6),
     })
     .run();
-  db.insert(schema.refunds)
-    .values({
-      purchaseId: liamPurchase.id,
-      status: RefundStatus.Open,
-      reason: "Bought the wrong one, I meant the advanced course.",
-      requestedAt: daysAgo(4),
-    })
-    .run();
+  // Raising a Refund Request notifies every Platform Admin, as a real raise does.
+  function seedOpenRefundRequest(
+    purchase: typeof schema.purchases.$inferSelect,
+    reason: string,
+    requestedAt: string
+  ) {
+    db.transaction((tx) => {
+      const refundRequest = tx
+        .insert(schema.refunds)
+        .values({
+          purchaseId: purchase.id,
+          status: RefundStatus.Open,
+          reason,
+          requestedAt,
+        })
+        .returning()
+        .get();
+
+      notify(tx, {
+        kind: NotificationEventKind.RefundRequestRaised,
+        actorId: purchase.userId,
+        refundRequestId: refundRequest.id,
+        raisedAt: new Date(requestedAt),
+      });
+    });
+  }
+
+  seedOpenRefundRequest(
+    liamPurchase,
+    "Bought the wrong one, I meant the advanced course.",
+    daysAgo(4)
+  );
 
   console.log("Created Liam's Refund Request.");
 
@@ -2790,21 +2814,19 @@ This course is still in draft while the cluster examples are rewritten against t
   // A Team Licence with no Claimed Seats, so a Platform Admin can approve it.
   // Its Seats are on hold while the request is open.
 
-  db.insert(schema.refunds)
-    .values({
-      purchaseId: novakLicence.purchase.id,
-      status: RefundStatus.Open,
-      reason: "Our design team was reorganised and nobody needs these seats now.",
-      requestedAt: daysAgo(1),
-    })
-    .run();
+  seedOpenRefundRequest(
+    novakLicence.purchase,
+    "Our design team was reorganised and nobody needs these seats now.",
+    daysAgo(1)
+  );
 
   console.log("Created Marta's Refund Request on her Team Licence.");
 
   // ─── Declined Refund Requests and their Notifications ───
   // Declined, because a decline takes nothing away from the buyer. Each one
-  // raises its Notification through notify(), as a real decision does, so
-  // switching to Emma, James, Sophia or Bossy in DevUI shows an unread badge.
+  // raises its Notifications through notify(), as a real raise and decision
+  // do, so switching to Emma, James, Sophia or Bossy in DevUI shows an unread
+  // badge, and a Platform Admin sees each raise tagged Declined.
 
   function seedDeclinedRefundRequest(
     buyerEmail: string,
@@ -2845,6 +2867,12 @@ This course is still in draft while the cluster examples are rewritten against t
         .returning()
         .get();
 
+      notify(tx, {
+        kind: NotificationEventKind.RefundRequestRaised,
+        actorId: buyer.id,
+        refundRequestId: refundRequest.id,
+        raisedAt: new Date(requestedAt),
+      });
       notify(tx, {
         kind: NotificationEventKind.RefundRequestDeclined,
         actorId: admin.id,
@@ -2896,7 +2924,7 @@ This course is still in draft while the cluster examples are rewritten against t
   );
 
   console.log(
-    `Created ${countRows(schema.notifications)} Notifications for declined Refund Requests.`
+    `Created ${countRows(schema.notifications)} Notifications for raised and declined Refund Requests.`
   );
 
   // ─── Flush watch events ───

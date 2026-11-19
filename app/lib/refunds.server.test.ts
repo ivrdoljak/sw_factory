@@ -661,7 +661,147 @@ describe("Notifications from deciding a Refund Request", () => {
       { kind: "refund_request_declined" },
     ]);
     expect(countUnread(db, priya.id)).toBe(1);
+    // The Platform Admin hears about each raise, never about their own decisions.
+    expect(listNotifications(db, platformAdmin.id)).toMatchObject([
+      { kind: "refund_request_raised" },
+      { kind: "refund_request_raised" },
+    ]);
+    expect(countUnread(db, platformAdmin.id)).toBe(2);
+  });
+});
+
+describe("Notifications from raising a Refund Request", () => {
+  function addPlatformAdmin(name: string) {
+    return db
+      .insert(schema.users)
+      .values({
+        name,
+        email: `${name.toLowerCase()}@example.com`,
+        role: UserRole.Admin,
+      })
+      .returning()
+      .get();
+  }
+
+  it("a Refund Request raised on an Individual Purchase notifies every Platform Admin", () => {
+    const sam = addPlatformAdmin("Sam");
+    const purchase = buyForSelf(base.user.id);
+
+    raise(purchase.id, base.user.id);
+
+    for (const recipient of [platformAdmin, sam]) {
+      expect(listNotifications(db, recipient.id)).toEqual([
+        {
+          id: expect.any(Number),
+          kind: "refund_request_raised",
+          title: "Test User requested a refund for Test Course",
+          link: "/admin/refunds",
+          detail: null,
+          refundStatus: "open",
+          raisedAt: NOW.toISOString(),
+          read: false,
+        },
+      ]);
+      expect(countUnread(db, recipient.id)).toBe(1);
+    }
+    expect(listNotifications(db, base.user.id)).toEqual([]);
+  });
+
+  it("a Refund Request raised on a Team Licence notifies every Platform Admin", () => {
+    const sam = addPlatformAdmin("Sam");
+    const priya = addLearner("Priya");
+    const { purchase } = buySeats(priya.id, 3);
+
+    raise(purchase.id, priya.id);
+
+    for (const recipient of [platformAdmin, sam]) {
+      expect(listNotifications(db, recipient.id)).toMatchObject([
+        {
+          kind: "refund_request_raised",
+          title: "Priya requested a refund for Test Course",
+          link: "/admin/refunds",
+          refundStatus: "open",
+          read: false,
+        },
+      ]);
+    }
+    expect(listNotifications(db, priya.id)).toEqual([]);
+  });
+
+  it("a Platform Admin who raises a Refund Request is not notified about it", () => {
+    const sam = addPlatformAdmin("Sam");
+    const purchase = buyForSelf(platformAdmin.id);
+
+    raise(purchase.id, platformAdmin.id);
+
     expect(listNotifications(db, platformAdmin.id)).toEqual([]);
     expect(countUnread(db, platformAdmin.id)).toBe(0);
+    expect(listNotifications(db, sam.id)).toMatchObject([
+      { title: "Pat Admin requested a refund for Test Course" },
+    ]);
+  });
+
+  it("shows whether the Refund Request is still Open, or already Approved or Declined", () => {
+    const priya = addLearner("Priya");
+    const approved = raise(buyForSelf(base.user.id).id, base.user.id);
+    const declined = raise(buyForSelf(priya.id).id, priya.id);
+
+    expect(listNotifications(db, platformAdmin.id)).toMatchObject([
+      { title: "Priya requested a refund for Test Course", refundStatus: "open" },
+      { title: "Test User requested a refund for Test Course", refundStatus: "open" },
+    ]);
+
+    const sam = addPlatformAdmin("Sam");
+    approveRefundRequest(db, approved, sam.id, null, NOW);
+    declineRefundRequest(db, declined, sam.id, "Past half way.", NOW);
+
+    expect(listNotifications(db, platformAdmin.id)).toMatchObject([
+      { title: "Priya requested a refund for Test Course", refundStatus: "declined" },
+      { title: "Test User requested a refund for Test Course", refundStatus: "approved" },
+    ]);
+  });
+
+  it("a raise that fails its checks creates no Refund Request and raises no Notification", () => {
+    const purchase = buyForSelf(base.user.id);
+    const outOfWindow = buyForSelf(addLearner("Ben").id, 15);
+    raise(purchase.id, base.user.id);
+
+    const results = [
+      // Already has an Open Refund Request.
+      raiseRefundRequest(db, purchase.id, base.user.id, "Again, please.", NOW),
+      // Not the buyer.
+      raiseRefundRequest(db, purchase.id, addLearner("Cleo").id, "Mine now.", NOW),
+      // The 14-day window has closed.
+      raiseRefundRequest(db, outOfWindow.id, outOfWindow.userId, "Too late.", NOW),
+    ];
+
+    expect(results.map((result) => result.ok)).toEqual([false, false, false]);
+    expect(listRefundRequestsForReview(db, RefundStatus.Open, NOW)).toHaveLength(1);
+    expect(listNotifications(db, platformAdmin.id)).toMatchObject([
+      { title: "Test User requested a refund for Test Course" },
+    ]);
+    expect(countUnread(db, platformAdmin.id)).toBe(1);
+  });
+
+  it("still emails the buyer that their refund request is in", () => {
+    const purchase = buyForSelf(base.user.id);
+
+    const result = raiseRefundRequest(db, purchase.id, base.user.id, "Nope.", NOW);
+
+    if (!result.ok) throw new Error(result.error);
+    expect(result.email).toEqual({
+      to: "test@example.com",
+      subject: "Refund requested — Test Course",
+      body: [
+        "Hi Test User,",
+        "",
+        'We have your refund request for "Test Course".',
+        "The refund is for $79.00, the amount you paid.",
+        "",
+        "Our team reviews every refund request by hand. You do not need to do anything else — we will email you again when it is done.",
+        "",
+        "— The Cadence team",
+      ].join("\n"),
+    });
   });
 });
