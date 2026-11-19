@@ -1,4 +1,4 @@
-import { and, count, desc, eq, isNull } from "drizzle-orm";
+import { and, count, desc, eq, isNull, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { alias } from "drizzle-orm/sqlite-core";
 import * as schema from "~/db/schema";
@@ -298,14 +298,28 @@ type NotificationRow = ReturnType<
   ReturnType<typeof selectNotifications>["all"]
 >[number];
 
-/** The recipient's Notifications, newest first. */
+/** How many Notifications the drawer loads at a time. */
+export const NOTIFICATIONS_PAGE_SIZE = 20;
+
+/**
+ * Which of the recipient's Notifications to list. Filters and cursors belong
+ * here; a cursor must be the (raisedAt, id) pair the list is sorted by, since
+ * `raisedAt` comes from the event and doesn't follow insertion order.
+ */
+export type NotificationListQuery = {
+  limit?: number;
+};
+
+/** The recipient's newest Notifications, newest first: one page of the drawer. */
 export function listNotifications(
   db: Queryable,
-  recipientId: number
+  recipientId: number,
+  { limit = NOTIFICATIONS_PAGE_SIZE }: NotificationListQuery = {}
 ): NotificationForDisplay[] {
   return selectNotifications(db)
     .where(eq(notifications.recipientId, recipientId))
     .orderBy(desc(notifications.raisedAt), desc(notifications.id))
+    .limit(limit)
     .all()
     .flatMap((row) => {
       const rendered = render(row);
@@ -327,6 +341,31 @@ export function countUnread(db: Queryable, recipientId: number): number {
     .get();
 
   return result?.unread ?? 0;
+}
+
+/**
+ * Marks one of the recipient's Notifications read. A Notification that is
+ * already read keeps the time it was first read. Returns false when the
+ * recipient has no Notification with that id.
+ */
+export function markRead(
+  db: Queryable,
+  recipientId: number,
+  notificationId: number,
+  at: Date = new Date()
+): boolean {
+  const result = db
+    .update(notifications)
+    .set({ readAt: sql`coalesce(${notifications.readAt}, ${at.toISOString()})` })
+    .where(
+      and(
+        eq(notifications.id, notificationId),
+        eq(notifications.recipientId, recipientId)
+      )
+    )
+    .run();
+
+  return result.changes > 0;
 }
 
 // ─── Rendering ───
