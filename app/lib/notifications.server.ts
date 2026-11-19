@@ -1,7 +1,5 @@
 import { and, count, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
-import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { alias } from "drizzle-orm/sqlite-core";
-import * as schema from "~/db/schema";
 import {
   comments,
   coupons,
@@ -16,6 +14,7 @@ import {
   RefundStatus,
   UserRole,
 } from "~/db/schema";
+import type { Queryable, Tx } from "~/db/types";
 import { commentExcerpt } from "~/lib/comment-markdown.server";
 import { commentAnchorId } from "~/lib/comments";
 
@@ -32,10 +31,6 @@ import { commentAnchorId } from "~/lib/comments";
 // Adding a Notification Event kind is additive: a member of the
 // `NotificationEvent` union, a branch in `findDelivery`, and a branch in
 // `render`.
-
-type Db = BetterSQLite3Database<typeof schema>;
-type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type Queryable = Db | Tx;
 
 // ─── Notification Events ───
 
