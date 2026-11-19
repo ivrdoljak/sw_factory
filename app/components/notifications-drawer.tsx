@@ -244,16 +244,21 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
     scrollTop: number;
     scrollHeight: number;
   } | null>(null);
+  // Whether "Load older" was used on the list shown. The older fetcher keeps
+  // its last URL after the list resets, and reloads it after any mark; that
+  // page belongs to the old list and would leave a gap in the new one.
+  const olderPagesShown = useRef(false);
 
   const { load: loadNewest } = newestFetcher;
   useEffect(() => {
     if (!open) return;
+    olderPagesShown.current = false;
     setState(LOADING);
     void loadNewest(listUrl(filter));
   }, [open, filter, loadNewest]);
 
   // Each page is handled once, when it arrives. One loaded for another filter
-  // is dropped, and an older page only extends a list already shown.
+  // is dropped, and an older page only extends the list it was loaded for.
   useEffect(() => {
     const page = pageFor(newestFetcher.data, filterRef.current);
     if (!page) return;
@@ -264,7 +269,7 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
   }, [newestFetcher.data]);
   useEffect(() => {
     const page = pageFor(olderFetcher.data, filterRef.current);
-    if (!page) return;
+    if (!page || !olderPagesShown.current) return;
     setState((list) =>
       list.notifications === null ? list : mergePage(shown(list), page)
     );
@@ -272,7 +277,9 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
 
   function loadOlder() {
     const oldest = state.notifications?.at(-1);
-    if (oldest) void olderFetcher.load(listUrl(filter, oldest));
+    if (!oldest) return;
+    olderPagesShown.current = true;
+    void olderFetcher.load(listUrl(filter, oldest));
   }
 
   /**
