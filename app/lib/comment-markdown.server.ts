@@ -115,7 +115,8 @@ export async function renderComment(markdown: string): Promise<string> {
 // ─── Comment Excerpts ───
 // A comment as a short line of plain text, for showing it somewhere that
 // isn't the thread (a Notification's inline detail). It is shown as text, not
-// HTML, so markdown syntax goes, tags go, and entities are decoded.
+// HTML, so markdown syntax goes and entities are decoded. Tags stay, as the
+// literal text the thread shows.
 
 export const COMMENT_EXCERPT_LENGTH = 140;
 
@@ -145,8 +146,11 @@ function inlineText(tokens: Token[]): string {
 
 function tokenText(token: Token): string {
   switch (token.type) {
+    // The thread shows raw HTML as literal text (see renderComment), and on a
+    // programming course it is usually code typed without backticks
+    // (Array<string>), so it stays.
     case "html":
-      return token.text.replace(/<[^>]*>/g, "");
+      return token.text;
     case "list":
       return blocksText(token.items);
     case "list_item":

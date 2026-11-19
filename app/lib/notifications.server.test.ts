@@ -193,8 +193,16 @@ describe("a new question", () => {
     expect(listNotifications(db, base.instructor.id)).toMatchObject([
       {
         detail:
-          "Why this & scope? Is this the right docs? It's odd & a cat first second const a = 1 < 2;",
+          "Why this & <b>scope</b>? Is this the right docs? It's odd & a cat first second const a = 1 < 2;",
       },
+    ]);
+  });
+
+  it("keeps angle brackets the Student typed, as the thread shows them", () => {
+    ask(base.user.id, "How do I type Array<string> inside <Suspense>?");
+
+    expect(listNotifications(db, base.instructor.id)).toMatchObject([
+      { detail: "How do I type Array<string> inside <Suspense>?" },
     ]);
   });
 
