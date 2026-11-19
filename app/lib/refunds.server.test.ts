@@ -14,6 +14,7 @@ import {
   listTeamLicences,
   raiseRefundRequest,
 } from "./refunds.server";
+import { countUnread, listNotifications } from "./notifications.server";
 
 type TestDb = ReturnType<typeof createTestDb>;
 
@@ -500,5 +501,167 @@ describe("listing Refund Requests", () => {
       { seatCount: 2, claimedSeatCount: 1, canRequestRefund: false },
       { seatCount: 2, claimedSeatCount: 0, canRequestRefund: true },
     ]);
+  });
+});
+
+describe("Notifications from deciding a Refund Request", () => {
+  it("an approved Refund Request on an Individual Purchase notifies the buyer", () => {
+    const purchase = buyForSelf(base.user.id);
+    const id = raise(purchase.id, base.user.id);
+
+    approveRefundRequest(db, id, platformAdmin.id, null, NOW);
+
+    expect(listNotifications(db, base.user.id)).toEqual([
+      {
+        id: expect.any(Number),
+        kind: "refund_request_approved",
+        title: "Your refund request for Test Course was approved",
+        link: "/courses/test-course",
+        detail: null,
+        refundStatus: null,
+        raisedAt: NOW.toISOString(),
+        read: false,
+      },
+    ]);
+    expect(countUnread(db, base.user.id)).toBe(1);
+  });
+
+  it("a declined Refund Request notifies the buyer with the decision note", () => {
+    const purchase = buyForSelf(base.user.id);
+    const id = raise(purchase.id, base.user.id);
+
+    declineRefundRequest(db, id, platformAdmin.id, "  Past half way.  ", NOW);
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      {
+        kind: "refund_request_declined",
+        title: "Your refund request for Test Course was declined",
+        link: "/courses/test-course",
+        detail: "Past half way.",
+        refundStatus: null,
+        read: false,
+      },
+    ]);
+  });
+
+  it("an approved Refund Request shows no detail, even with a note", () => {
+    const purchase = buyForSelf(base.user.id);
+    const id = raise(purchase.id, base.user.id);
+
+    approveRefundRequest(db, id, platformAdmin.id, "Sorry to see you go.", NOW);
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { kind: "refund_request_approved", detail: null },
+    ]);
+  });
+
+  it("a decision on a Team Licence notifies the Team Admin who bought it, linking to the Team page", () => {
+    const priya = addLearner("Priya");
+    const approved = buySeats(priya.id, 2);
+    const declined = buySeats(priya.id, 2);
+
+    approveRefundRequest(
+      db,
+      raise(approved.purchase.id, priya.id),
+      platformAdmin.id,
+      null,
+      NOW
+    );
+    declineRefundRequest(
+      db,
+      raise(declined.purchase.id, priya.id),
+      platformAdmin.id,
+      "Your team is still using it.",
+      NOW
+    );
+
+    expect(listNotifications(db, priya.id)).toMatchObject([
+      {
+        title: "Your refund request for Test Course was declined",
+        link: "/team",
+        detail: "Your team is still using it.",
+      },
+      {
+        title: "Your refund request for Test Course was approved",
+        link: "/team",
+        detail: null,
+      },
+    ]);
+  });
+
+  it("a decision that fails raises no Notification", () => {
+    const priya = addLearner("Priya");
+    const { purchase: licence, seats } = buySeats(priya.id, 2);
+    const licenceRequest = raise(licence.id, priya.id);
+    claimSeat(seats[0].id, addLearner("Ben").id);
+
+    const purchase = buyForSelf(base.user.id);
+    const id = raise(purchase.id, base.user.id);
+    approveRefundRequest(db, id, platformAdmin.id, null, NOW);
+
+    // Seat claimed after the request: it can only be declined.
+    approveRefundRequest(db, licenceRequest, platformAdmin.id, null, NOW);
+    // A decline needs a note.
+    declineRefundRequest(db, licenceRequest, platformAdmin.id, "  ", NOW);
+    // Already decided.
+    declineRefundRequest(db, id, platformAdmin.id, "Too late.", NOW);
+
+    expect(listNotifications(db, priya.id)).toEqual([]);
+    expect(countUnread(db, priya.id)).toBe(0);
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { kind: "refund_request_approved" },
+    ]);
+  });
+
+  it("shows the course's current title after it is renamed", () => {
+    const purchase = buyForSelf(base.user.id);
+    approveRefundRequest(
+      db,
+      raise(purchase.id, base.user.id),
+      platformAdmin.id,
+      null,
+      NOW
+    );
+
+    db.update(schema.courses)
+      .set({ title: "TypeScript, Properly?" })
+      .where(eq(schema.courses.id, base.course.id))
+      .run();
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { title: "Your refund request for TypeScript, Properly? was approved" },
+    ]);
+  });
+
+  it("each person sees only their own Notifications", () => {
+    const priya = addLearner("Priya");
+    const priyaPurchase = buyForSelf(priya.id);
+    const purchase = buyForSelf(base.user.id);
+
+    approveRefundRequest(
+      db,
+      raise(purchase.id, base.user.id),
+      platformAdmin.id,
+      null,
+      NOW
+    );
+    declineRefundRequest(
+      db,
+      raise(priyaPurchase.id, priya.id),
+      platformAdmin.id,
+      "Past half way.",
+      NOW
+    );
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { kind: "refund_request_approved" },
+    ]);
+    expect(countUnread(db, base.user.id)).toBe(1);
+    expect(listNotifications(db, priya.id)).toMatchObject([
+      { kind: "refund_request_declined" },
+    ]);
+    expect(countUnread(db, priya.id)).toBe(1);
+    expect(listNotifications(db, platformAdmin.id)).toEqual([]);
+    expect(countUnread(db, platformAdmin.id)).toBe(0);
   });
 });

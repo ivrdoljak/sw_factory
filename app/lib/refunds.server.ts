@@ -14,8 +14,10 @@ import {
   users,
   videoWatchEvents,
   LessonProgressStatus,
+  NotificationEventKind,
   RefundStatus,
 } from "~/db/schema";
+import { notify } from "~/lib/notifications.server";
 import { formatPrice } from "~/lib/utils";
 import {
   REFUND_COMPLETION_LIMIT,
@@ -677,6 +679,13 @@ export function approveRefundRequest(
       .where(eq(refunds.id, refundRequestId))
       .run();
 
+    notify(tx, {
+      kind: NotificationEventKind.RefundRequestApproved,
+      actorId: platformAdminId,
+      refundRequestId,
+      raisedAt: now,
+    });
+
     return {
       ok: true,
       email: buildDecisionEmail(tx, purchase, RefundStatus.Approved, note),
@@ -719,6 +728,13 @@ export function declineRefundRequest(
       })
       .where(eq(refunds.id, refundRequestId))
       .run();
+
+    notify(tx, {
+      kind: NotificationEventKind.RefundRequestDeclined,
+      actorId: platformAdminId,
+      refundRequestId,
+      raisedAt: now,
+    });
 
     return {
       ok: true,
