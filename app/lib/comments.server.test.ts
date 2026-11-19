@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { sql } from "drizzle-orm";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createTestDb, seedBaseData } from "~/test/setup";
 import * as schema from "~/db/schema";
 import { NotificationEventKind } from "~/db/schema";
+import * as notifications from "./notifications.server";
 import { countUnread, listNotifications } from "./notifications.server";
 import { postLessonCommentAndNotify } from "./comments.server";
 
@@ -11,6 +11,10 @@ type TestDb = ReturnType<typeof createTestDb>;
 let db: TestDb;
 let base: ReturnType<typeof seedBaseData>;
 let lessonId: number;
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 beforeEach(() => {
   db = createTestDb();
@@ -107,12 +111,10 @@ describe("replying in a lesson thread", () => {
       "How do closures work?"
     );
 
-    // Make notify() fail inside the transaction: the database refuses to
-    // store any Notification.
-    db.run(
-      sql`CREATE TRIGGER notifications_unavailable BEFORE INSERT ON notifications
-          BEGIN SELECT RAISE(ABORT, 'Notifications are unavailable'); END`
-    );
+    // Make notify() fail once, inside the transaction, after the reply is in.
+    vi.spyOn(notifications, "notify").mockImplementationOnce(() => {
+      throw new Error("Notifications are unavailable");
+    });
     expect(() =>
       postLessonCommentAndNotify(
         db,
@@ -122,7 +124,6 @@ describe("replying in a lesson thread", () => {
         "Same question here."
       )
     ).toThrow("Notifications are unavailable");
-    db.run(sql`DROP TRIGGER notifications_unavailable`);
 
     // Had Sam's reply survived, Sam would now be in the thread and notified,
     // and the question's author would have a Notification for it.
