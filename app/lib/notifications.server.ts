@@ -1,15 +1,23 @@
 import { and, count, desc, eq, isNull, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import { alias } from "drizzle-orm/sqlite-core";
 import * as schema from "~/db/schema";
 import {
+  comments,
   coupons,
   courses,
+  lessons,
+  modules,
   notifications,
   purchases,
   refunds,
+  users,
   NotificationEventKind,
   RefundStatus,
+  UserRole,
 } from "~/db/schema";
+import { commentExcerpt } from "~/lib/comment-markdown.server";
+import { commentAnchorId } from "~/lib/comments";
 
 // ─── Notifications ───
 // The only code that reads or writes Notifications (docs/adr/0013, spec #18).
@@ -41,8 +49,36 @@ type RefundDecisionEvent = {
   raisedAt: Date;
 };
 
+type RefundRequestRaisedEvent = {
+  kind: NotificationEventKind.RefundRequestRaised;
+  /** The buyer who raised it. */
+  actorId: number;
+  refundRequestId: number;
+  raisedAt: Date;
+};
+
+type SeatClaimedEvent = {
+  kind: NotificationEventKind.SeatClaimed;
+  /** The Student who claimed the Seat. */
+  actorId: number;
+  seatId: number;
+  raisedAt: Date;
+};
+
+type NewQuestionEvent = {
+  kind: NotificationEventKind.NewQuestion;
+  /** Whoever asked: the author of the top-level comment. */
+  actorId: number;
+  commentId: number;
+  raisedAt: Date;
+};
+
 /** A Notification Event with its facts: which kind, who acted, and the ids involved. */
-export type NotificationEvent = RefundDecisionEvent;
+export type NotificationEvent =
+  | RefundDecisionEvent
+  | RefundRequestRaisedEvent
+  | SeatClaimedEvent
+  | NewQuestionEvent;
 
 // ─── Write side ───
 
@@ -93,6 +129,12 @@ function findDelivery(tx: Tx, event: NotificationEvent): Delivery {
       return refundDecisionDelivery(tx, event);
     case NotificationEventKind.RefundRequestDeclined:
       return refundDecisionDelivery(tx, event);
+    case NotificationEventKind.RefundRequestRaised:
+      return refundRequestRaisedDelivery(tx, event);
+    case NotificationEventKind.SeatClaimed:
+      return seatClaimedDelivery(tx, event);
+    case NotificationEventKind.NewQuestion:
+      return newQuestionDelivery(tx, event);
   }
 }
 
@@ -101,14 +143,48 @@ function refundDecisionDelivery(
   tx: Tx,
   event: RefundDecisionEvent
 ): Delivery {
+  const found = findRefundRequest(tx, event.refundRequestId);
+  if (!found) return NOBODY;
+
+  return { recipientIds: [found.buyerId], references: found.references };
+}
+
+/**
+ * A raised Refund Request goes to every Platform Admin, so no request depends
+ * on one person watching the Refund Requests page.
+ */
+function refundRequestRaisedDelivery(
+  tx: Tx,
+  event: RefundRequestRaisedEvent
+): Delivery {
+  const found = findRefundRequest(tx, event.refundRequestId);
+  if (!found) return NOBODY;
+
+  const platformAdmins = tx
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.role, UserRole.Admin))
+    .all();
+
+  return {
+    recipientIds: platformAdmins.map((platformAdmin) => platformAdmin.id),
+    references: found.references,
+  };
+}
+
+/** The buyer of a Refund Request's Purchase, and what its Notifications refer to. */
+function findRefundRequest(
+  tx: Tx,
+  refundRequestId: number
+): { buyerId: number; references: References } | null {
   const found = tx
     .select({ purchase: purchases })
     .from(refunds)
     .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
-    .where(eq(refunds.id, event.refundRequestId))
+    .where(eq(refunds.id, refundRequestId))
     .get();
 
-  if (!found) return NOBODY;
+  if (!found) return null;
 
   const { purchase } = found;
 
@@ -120,13 +196,61 @@ function refundDecisionDelivery(
     .get();
 
   return {
-    recipientIds: [purchase.userId],
+    buyerId: purchase.userId,
     references: {
       courseId: purchase.courseId,
-      refundRequestId: event.refundRequestId,
+      refundRequestId,
       ...(isTeamLicence
         ? { teamLicenceId: purchase.id }
         : { purchaseId: purchase.id }),
+    },
+  };
+}
+
+/** A claimed Seat goes to the Team Admin who bought its Team Licence. */
+function seatClaimedDelivery(tx: Tx, event: SeatClaimedEvent): Delivery {
+  const found = tx
+    .select({ teamLicence: purchases })
+    .from(coupons)
+    .innerJoin(purchases, eq(coupons.purchaseId, purchases.id))
+    .where(eq(coupons.id, event.seatId))
+    .get();
+
+  if (!found) return NOBODY;
+
+  const { teamLicence } = found;
+  return {
+    recipientIds: [teamLicence.userId],
+    references: {
+      courseId: teamLicence.courseId,
+      teamLicenceId: teamLicence.id,
+    },
+  };
+}
+
+/** A question on a lesson goes to the course's Instructor. */
+function newQuestionDelivery(tx: Tx, event: NewQuestionEvent): Delivery {
+  const found = tx
+    .select({
+      lessonId: lessons.id,
+      courseId: courses.id,
+      instructorId: courses.instructorId,
+    })
+    .from(comments)
+    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .innerJoin(courses, eq(modules.courseId, courses.id))
+    .where(eq(comments.id, event.commentId))
+    .get();
+
+  if (!found) return NOBODY;
+
+  return {
+    recipientIds: [found.instructorId],
+    references: {
+      courseId: found.courseId,
+      lessonId: found.lessonId,
+      commentId: event.commentId,
     },
   };
 }
@@ -147,18 +271,26 @@ export type NotificationForDisplay = {
   read: boolean;
 };
 
+const actors = alias(users, "actors");
+
 function selectNotifications(db: Queryable) {
   return db
     .select({
       notification: notifications,
+      actor: { name: actors.name },
       course: { title: courses.title, slug: courses.slug },
+      lesson: { title: lessons.title },
+      comment: { body: comments.body, deletedAt: comments.deletedAt },
       refundRequest: {
         status: refunds.status,
         decisionNote: refunds.decisionNote,
       },
     })
     .from(notifications)
+    .leftJoin(actors, eq(notifications.actorId, actors.id))
     .leftJoin(courses, eq(notifications.courseId, courses.id))
+    .leftJoin(lessons, eq(notifications.lessonId, lessons.id))
+    .leftJoin(comments, eq(notifications.commentId, comments.id))
     .leftJoin(refunds, eq(notifications.refundRequestId, refunds.id));
 }
 
@@ -264,10 +396,13 @@ function renderKind(row: NotificationRow): Rendered | null {
       return renderRefundRequestApproved(row);
     case NotificationEventKind.RefundRequestDeclined:
       return renderRefundRequestDeclined(row);
-    // Not raised yet: each gets its renderer with the ticket that raises it.
     case NotificationEventKind.RefundRequestRaised:
+      return renderRefundRequestRaised(row);
     case NotificationEventKind.SeatClaimed:
+      return renderSeatClaimed(row);
     case NotificationEventKind.NewQuestion:
+      return renderNewQuestion(row);
+    // Not raised yet: each gets its renderer with the ticket that raises it.
     case NotificationEventKind.NewReply:
       return null;
   }
@@ -292,6 +427,30 @@ function renderRefundRequestDeclined(row: NotificationRow): Rendered {
   };
 }
 
+function renderRefundRequestRaised(row: NotificationRow): Rendered {
+  const course = row.course?.title ?? "a course";
+  return {
+    title: `${actorName(row)} requested a refund for ${course}`,
+    link: "/admin/refunds",
+    detail: null,
+    // Read live, so a Platform Admin can see another has already decided it.
+    refundStatus: row.refundRequest?.status ?? null,
+  };
+}
+
+function renderSeatClaimed(row: NotificationRow): Rendered {
+  return {
+    title: `${actorName(row)} claimed a Seat on ${courseTitle(row)}`,
+    link: "/team",
+    detail: null,
+    refundStatus: null,
+  };
+}
+
+function actorName(row: NotificationRow): string {
+  return row.actor?.name ?? "Someone";
+}
+
 function courseTitle(row: NotificationRow): string {
   return row.course?.title ?? "your course";
 }
@@ -300,4 +459,38 @@ function courseTitle(row: NotificationRow): string {
 function refundDecisionLink(row: NotificationRow): string {
   if (row.notification.teamLicenceId !== null) return "/team";
   return row.course ? `/courses/${row.course.slug}` : "/courses";
+}
+
+function renderNewQuestion(row: NotificationRow): Rendered {
+  return {
+    title: `${actorName(row)} asked a question on ${lessonTitle(row)}`,
+    link: commentLink(row),
+    detail: commentDetail(row),
+    refundStatus: null,
+  };
+}
+
+/**
+ * The inline detail for a Notification about a comment (a question or a
+ * reply): the comment as it reads now, as a short plain-text excerpt.
+ */
+function commentDetail(row: NotificationRow): string {
+  if (!row.comment || row.comment.deletedAt !== null) {
+    return "This comment was deleted.";
+  }
+  return commentExcerpt(row.comment.body);
+}
+
+function lessonTitle(row: NotificationRow): string {
+  return row.lesson?.title ?? "a lesson";
+}
+
+/** The lesson page, at the comment's anchor. */
+function commentLink(row: NotificationRow): string {
+  const { lessonId, commentId } = row.notification;
+  if (!row.course || lessonId === null) return "/courses";
+  const lessonPage = `/courses/${row.course.slug}/lessons/${lessonId}`;
+  return commentId === null
+    ? lessonPage
+    : `${lessonPage}#${commentAnchorId(commentId)}`;
 }

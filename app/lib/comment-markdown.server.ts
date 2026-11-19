@@ -1,4 +1,4 @@
-import { marked, Renderer } from "marked";
+import { marked, Renderer, type Token, type Tokens } from "marked";
 import { type Highlighter, createHighlighter } from "shiki";
 
 // ─── Comment Rendering ───
@@ -110,4 +110,84 @@ export async function renderComment(markdown: string): Promise<string> {
   renderer.image = ({ text }) => escapeHtml(text ?? "");
 
   return marked.parse(markdown, { renderer, async: false }) as string;
+}
+
+// ─── Comment Excerpts ───
+// A comment as a short line of plain text, for showing it somewhere that
+// isn't the thread (a Notification's inline detail). It is shown as text, not
+// HTML, so markdown syntax goes and entities are decoded. Tags stay, as the
+// literal text the thread shows.
+
+export const COMMENT_EXCERPT_LENGTH = 140;
+
+const ENTITIES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+  "&nbsp;": " ",
+};
+
+function decodeEntities(value: string): string {
+  return value.replace(/&(?:amp|lt|gt|quot|#39|nbsp);/g, (entity) =>
+    ENTITIES[entity] ?? entity
+  );
+}
+
+/** Blocks (paragraphs, list items, cells) are separated by a space; inline runs are not. */
+function blocksText(tokens: Token[]): string {
+  return tokens.map(tokenText).join(" ");
+}
+
+function inlineText(tokens: Token[]): string {
+  return tokens.map(tokenText).join("");
+}
+
+function tokenText(token: Token): string {
+  switch (token.type) {
+    // The thread shows raw HTML as literal text (see renderComment), and on a
+    // programming course it is usually code typed without backticks
+    // (Array<string>), so it stays.
+    case "html":
+      return token.text;
+    case "list":
+      return blocksText(token.items);
+    case "list_item":
+    case "blockquote":
+      return blocksText(token.tokens ?? []);
+    case "table":
+      return [token.header, ...token.rows]
+        .map((cells: Tokens.TableCell[]) =>
+          cells.map((cell) => inlineText(cell.tokens)).join(" ")
+        )
+        .join(" ");
+    case "space":
+    case "hr":
+    case "br":
+      return " ";
+  }
+  if ("tokens" in token && token.tokens) return inlineText(token.tokens);
+  return "text" in token && typeof token.text === "string" ? token.text : "";
+}
+
+/**
+ * The start of a comment as plain text: markdown stripped, whitespace
+ * collapsed, and cut at a word to about `maxLength` characters, with "…" when
+ * anything was cut.
+ */
+export function commentExcerpt(
+  markdown: string,
+  maxLength = COMMENT_EXCERPT_LENGTH
+): string {
+  const text = decodeEntities(blocksText(marked.lexer(markdown)))
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (text.length <= maxLength) return text;
+
+  const cut = text.slice(0, maxLength);
+  const lastSpace = cut.lastIndexOf(" ");
+  const atWord = lastSpace > maxLength / 2 ? cut.slice(0, lastSpace) : cut;
+  return `${atWord.trimEnd()}…`;
 }

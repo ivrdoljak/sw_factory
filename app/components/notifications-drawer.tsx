@@ -240,7 +240,8 @@ function NotificationRow({
         {KIND_ICONS[notification.kind]}
       </div>
       <div className="min-w-0 flex-1">
-        {/* The link stretches over the whole row, so clicking anywhere opens it. */}
+        {/* The link stretches over the whole row, so clicking anywhere opens it.
+            Any other control in the row needs `relative z-10` to sit above it. */}
         <Link
           to={notification.link}
           onClick={onOpen}
