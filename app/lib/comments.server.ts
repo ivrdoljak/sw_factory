@@ -27,14 +27,15 @@ export function postLessonCommentAndNotify(
   return db.transaction((tx) => {
     const comment = postLessonComment(tx, userId, lessonId, parentId, body);
 
-    if (comment.parentId === null) {
-      notify(tx, {
-        kind: NotificationEventKind.NewQuestion,
-        actorId: userId,
-        commentId: comment.id,
-        raisedAt: new Date(comment.createdAt),
-      });
-    }
+    notify(tx, {
+      kind:
+        comment.parentId === null
+          ? NotificationEventKind.NewQuestion
+          : NotificationEventKind.NewReply,
+      actorId: userId,
+      commentId: comment.id,
+      raisedAt: new Date(comment.createdAt),
+    });
 
     return comment;
   });

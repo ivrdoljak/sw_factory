@@ -1,4 +1,4 @@
-import { and, count, desc, eq, isNull } from "drizzle-orm";
+import { and, count, desc, eq, isNull, or } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { alias } from "drizzle-orm/sqlite-core";
 import * as schema from "~/db/schema";
@@ -73,12 +73,22 @@ type NewQuestionEvent = {
   raisedAt: Date;
 };
 
+type NewReplyEvent = {
+  kind: NotificationEventKind.NewReply;
+  /** Whoever replied: the author of the reply. */
+  actorId: number;
+  /** The reply, not the question it answers. */
+  commentId: number;
+  raisedAt: Date;
+};
+
 /** A Notification Event with its facts: which kind, who acted, and the ids involved. */
 export type NotificationEvent =
   | RefundDecisionEvent
   | RefundRequestRaisedEvent
   | SeatClaimedEvent
-  | NewQuestionEvent;
+  | NewQuestionEvent
+  | NewReplyEvent;
 
 // ─── Write side ───
 
@@ -135,6 +145,8 @@ function findDelivery(tx: Tx, event: NotificationEvent): Delivery {
       return seatClaimedDelivery(tx, event);
     case NotificationEventKind.NewQuestion:
       return newQuestionDelivery(tx, event);
+    case NotificationEventKind.NewReply:
+      return newReplyDelivery(tx, event);
   }
 }
 
@@ -255,6 +267,48 @@ function newQuestionDelivery(tx: Tx, event: NewQuestionEvent): Delivery {
   };
 }
 
+/**
+ * A reply goes to everyone who has posted in its thread: the question's author
+ * and every replier. Deleted comments still count their authors as having
+ * posted. `notify` drops the replier and anyone listed twice.
+ */
+function newReplyDelivery(tx: Tx, event: NewReplyEvent): Delivery {
+  const found = tx
+    .select({
+      questionId: comments.parentId,
+      lessonId: lessons.id,
+      courseId: courses.id,
+    })
+    .from(comments)
+    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .innerJoin(courses, eq(modules.courseId, courses.id))
+    .where(eq(comments.id, event.commentId))
+    .get();
+
+  if (!found || found.questionId === null) return NOBODY;
+
+  const posters = tx
+    .select({ authorId: comments.userId })
+    .from(comments)
+    .where(
+      or(
+        eq(comments.id, found.questionId),
+        eq(comments.parentId, found.questionId)
+      )
+    )
+    .all();
+
+  return {
+    recipientIds: posters.map((poster) => poster.authorId),
+    references: {
+      courseId: found.courseId,
+      lessonId: found.lessonId,
+      commentId: event.commentId,
+    },
+  };
+}
+
 // ─── Read side ───
 
 /** A Notification ready to display. */
@@ -363,9 +417,8 @@ function renderKind(row: NotificationRow): Rendered | null {
       return renderSeatClaimed(row);
     case NotificationEventKind.NewQuestion:
       return renderNewQuestion(row);
-    // Not raised yet: each gets its renderer with the ticket that raises it.
     case NotificationEventKind.NewReply:
-      return null;
+      return renderNewReply(row);
   }
 }
 
@@ -425,6 +478,15 @@ function refundDecisionLink(row: NotificationRow): string {
 function renderNewQuestion(row: NotificationRow): Rendered {
   return {
     title: `${actorName(row)} asked a question on ${lessonTitle(row)}`,
+    link: commentLink(row),
+    detail: commentDetail(row),
+    refundStatus: null,
+  };
+}
+
+function renderNewReply(row: NotificationRow): Rendered {
+  return {
+    title: `${actorName(row)} replied on ${lessonTitle(row)}`,
     link: commentLink(row),
     detail: commentDetail(row),
     refundStatus: null,
