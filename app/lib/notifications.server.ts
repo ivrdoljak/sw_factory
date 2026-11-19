@@ -11,6 +11,7 @@ import {
   users,
   NotificationEventKind,
   RefundStatus,
+  UserRole,
 } from "~/db/schema";
 
 // ─── Notifications ───
@@ -43,6 +44,14 @@ type RefundDecisionEvent = {
   raisedAt: Date;
 };
 
+type RefundRequestRaisedEvent = {
+  kind: NotificationEventKind.RefundRequestRaised;
+  /** The buyer who raised it. */
+  actorId: number;
+  refundRequestId: number;
+  raisedAt: Date;
+};
+
 type SeatClaimedEvent = {
   kind: NotificationEventKind.SeatClaimed;
   /** The Student who claimed the Seat. */
@@ -52,7 +61,10 @@ type SeatClaimedEvent = {
 };
 
 /** A Notification Event with its facts: which kind, who acted, and the ids involved. */
-export type NotificationEvent = RefundDecisionEvent | SeatClaimedEvent;
+export type NotificationEvent =
+  | RefundDecisionEvent
+  | RefundRequestRaisedEvent
+  | SeatClaimedEvent;
 
 // ─── Write side ───
 
@@ -103,6 +115,8 @@ function findDelivery(tx: Tx, event: NotificationEvent): Delivery {
       return refundDecisionDelivery(tx, event);
     case NotificationEventKind.RefundRequestDeclined:
       return refundDecisionDelivery(tx, event);
+    case NotificationEventKind.RefundRequestRaised:
+      return refundRequestRaisedDelivery(tx, event);
     case NotificationEventKind.SeatClaimed:
       return seatClaimedDelivery(tx, event);
   }
@@ -113,14 +127,48 @@ function refundDecisionDelivery(
   tx: Tx,
   event: RefundDecisionEvent
 ): Delivery {
+  const found = findRefundRequest(tx, event.refundRequestId);
+  if (!found) return NOBODY;
+
+  return { recipientIds: [found.buyerId], references: found.references };
+}
+
+/**
+ * A raised Refund Request goes to every Platform Admin, so no request depends
+ * on one person watching the Refund Requests page.
+ */
+function refundRequestRaisedDelivery(
+  tx: Tx,
+  event: RefundRequestRaisedEvent
+): Delivery {
+  const found = findRefundRequest(tx, event.refundRequestId);
+  if (!found) return NOBODY;
+
+  const platformAdmins = tx
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.role, UserRole.Admin))
+    .all();
+
+  return {
+    recipientIds: platformAdmins.map((platformAdmin) => platformAdmin.id),
+    references: found.references,
+  };
+}
+
+/** The buyer of a Refund Request's Purchase, and what its Notifications refer to. */
+function findRefundRequest(
+  tx: Tx,
+  refundRequestId: number
+): { buyerId: number; references: References } | null {
   const found = tx
     .select({ purchase: purchases })
     .from(refunds)
     .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
-    .where(eq(refunds.id, event.refundRequestId))
+    .where(eq(refunds.id, refundRequestId))
     .get();
 
-  if (!found) return NOBODY;
+  if (!found) return null;
 
   const { purchase } = found;
 
@@ -132,10 +180,10 @@ function refundDecisionDelivery(
     .get();
 
   return {
-    recipientIds: [purchase.userId],
+    buyerId: purchase.userId,
     references: {
       courseId: purchase.courseId,
-      refundRequestId: event.refundRequestId,
+      refundRequestId,
       ...(isTeamLicence
         ? { teamLicenceId: purchase.id }
         : { purchaseId: purchase.id }),
@@ -262,10 +310,11 @@ function renderKind(row: NotificationRow): Rendered | null {
       return renderRefundRequestApproved(row);
     case NotificationEventKind.RefundRequestDeclined:
       return renderRefundRequestDeclined(row);
+    case NotificationEventKind.RefundRequestRaised:
+      return renderRefundRequestRaised(row);
     case NotificationEventKind.SeatClaimed:
       return renderSeatClaimed(row);
     // Not raised yet: each gets its renderer with the ticket that raises it.
-    case NotificationEventKind.RefundRequestRaised:
     case NotificationEventKind.NewQuestion:
     case NotificationEventKind.NewReply:
       return null;
@@ -288,6 +337,17 @@ function renderRefundRequestDeclined(row: NotificationRow): Rendered {
     link: refundDecisionLink(row),
     detail: row.refundRequest?.decisionNote ?? null,
     refundStatus: null,
+  };
+}
+
+function renderRefundRequestRaised(row: NotificationRow): Rendered {
+  const course = row.course?.title ?? "a course";
+  return {
+    title: `${actorName(row)} requested a refund for ${course}`,
+    link: "/admin/refunds",
+    detail: null,
+    // Read live, so a Platform Admin can see another has already decided it.
+    refundStatus: row.refundRequest?.status ?? null,
   };
 }
 
