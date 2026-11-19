@@ -1,5 +1,5 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { Link, useFetcher } from "react-router";
+import { useEffect, useState, type MouseEvent, type ReactNode } from "react";
+import { Link, useFetcher, useNavigate } from "react-router";
 import {
   Bell,
   CheckCheck,
@@ -35,16 +35,35 @@ export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
   const [open, setOpen] = useState(false);
   const notifications = useNotificationList(open);
   const markFetcher = useFetcher();
+  const navigate = useNavigate();
 
-  /** Marks the Notification read and closes the drawer; its link navigates. */
-  function openNotification(notification: NotificationForDisplay) {
+  /**
+   * Marks the Notification read, closes the drawer and goes to its page. The
+   * navigation waits for the mark, so the page's loaders (and the badge) see
+   * it. A click that opens a new tab only marks it read.
+   */
+  async function openNotification(
+    event: MouseEvent<HTMLAnchorElement>,
+    notification: NotificationForDisplay
+  ) {
+    const opensElsewhere =
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey;
+
+    if (!opensElsewhere) {
+      event.preventDefault();
+      setOpen(false);
+    }
     if (!notification.read) {
-      markFetcher.submit(
+      await markFetcher.submit(
         { intent: "mark-read", notificationId: notification.id },
         { method: "post", action: NOTIFICATIONS_ENDPOINT }
       );
     }
-    setOpen(false);
+    if (!opensElsewhere) await navigate(notification.link);
   }
 
   return (
@@ -81,7 +100,7 @@ export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
                   <NotificationRow
                     key={notification.id}
                     notification={notification}
-                    onOpen={() => openNotification(notification)}
+                    onOpen={(event) => void openNotification(event, notification)}
                   />
                 ))}
               </section>
@@ -203,7 +222,7 @@ function NotificationRow({
   onOpen,
 }: {
   notification: NotificationForDisplay;
-  onOpen: () => void;
+  onOpen: (event: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   const unread = !notification.read;
   const statusTag = notification.refundStatus
