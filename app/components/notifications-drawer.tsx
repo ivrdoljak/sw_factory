@@ -272,14 +272,14 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
     if (!page) return;
     scrollBeforeArrivals.current = null;
     setState((list) =>
-      list.notifications === null ? page : mergePage(shown(list), page)
+      list.notifications === null ? page : mergePage(asPage(list), page)
     );
   }, [newestFetcher.data]);
   useEffect(() => {
     const page = pageFor(olderFetcher.data, filterRef.current);
     if (!page || !olderPagesShown.current) return;
     setState((list) =>
-      list.notifications === null ? list : mergePage(shown(list), page)
+      list.notifications === null ? list : mergePage(asPage(list), page)
     );
   }, [olderFetcher.data]);
 
@@ -324,7 +324,7 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
     setState((current) =>
       current.notifications === null
         ? current
-        : mergePage(shown(current), { notifications: arrivals, hasOlder: page.hasOlder })
+        : mergePage(asPage(current), { notifications: arrivals, hasOlder: page.hasOlder })
     );
   }
 
@@ -372,7 +372,8 @@ function useNotificationList(open: boolean, filter: NotificationFilter) {
   };
 }
 
-function shown({ notifications, hasOlder }: NotificationListState): NotificationPage {
+/** The list as a page, loading counting as empty. */
+function asPage({ notifications, hasOlder }: NotificationListState): NotificationPage {
   return { notifications: notifications ?? [], hasOlder };
 }
 
