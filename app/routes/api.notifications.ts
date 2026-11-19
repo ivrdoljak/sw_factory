@@ -3,7 +3,12 @@ import { z } from "zod";
 import type { Route } from "./+types/api.notifications";
 import { db } from "~/db";
 import { requireUserId } from "~/lib/access.server";
-import { listNotifications, markRead } from "~/lib/notifications.server";
+import {
+  listNotificationPage,
+  markAllRead,
+  markRead,
+  markUnread,
+} from "~/lib/notifications.server";
 import { parseFormData } from "~/lib/validation";
 
 // The one endpoint for the current user's Notifications (spec #18). Later
@@ -14,7 +19,18 @@ import { parseFormData } from "~/lib/validation";
 // - POST: the mark actions, one `intent` each in `actionSchema`. Posting from a
 //   fetcher revalidates the layout loader, so the sidebar badge refreshes.
 
-const listSchema = z.object({});
+const listSchema = z
+  .object({
+    filter: z.enum(["all", "unread"]).default("all"),
+    // "Load older": the oldest Notification shown, as its (raisedAt, id) pair.
+    beforeRaisedAt: z.string().datetime().optional(),
+    beforeId: z.coerce.number().int().positive().optional(),
+  })
+  .refine(
+    (query) =>
+      (query.beforeRaisedAt === undefined) === (query.beforeId === undefined),
+    "A cursor needs both beforeRaisedAt and beforeId"
+  );
 
 export async function loader({ request, url }: Route.LoaderArgs) {
   const userId = await requireUserId(request);
@@ -22,14 +38,23 @@ export async function loader({ request, url }: Route.LoaderArgs) {
   const parsed = listSchema.safeParse(Object.fromEntries(url.searchParams));
   if (!parsed.success) throw data("Invalid Notifications query", { status: 400 });
 
-  return { notifications: listNotifications(db, userId) };
+  const { filter, beforeRaisedAt, beforeId } = parsed.data;
+  const before =
+    beforeRaisedAt !== undefined && beforeId !== undefined
+      ? { raisedAt: beforeRaisedAt, id: beforeId }
+      : undefined;
+
+  const page = listNotificationPage(db, userId, { filter, before });
+  // The filter is echoed so the drawer can drop a page meant for another one.
+  return { ...page, filter };
 }
 
+const notificationId = z.coerce.number().int().positive();
+
 const actionSchema = z.discriminatedUnion("intent", [
-  z.object({
-    intent: z.literal("mark-read"),
-    notificationId: z.coerce.number().int().positive(),
-  }),
+  z.object({ intent: z.literal("mark-read"), notificationId }),
+  z.object({ intent: z.literal("mark-unread"), notificationId }),
+  z.object({ intent: z.literal("mark-all-read") }),
 ]);
 
 export async function action({ request }: Route.ActionArgs) {
@@ -43,6 +68,16 @@ export async function action({ request }: Route.ActionArgs) {
       if (!markRead(db, userId, parsed.data.notificationId)) {
         throw data("Notification not found", { status: 404 });
       }
+      return { ok: true };
+    }
+    case "mark-unread": {
+      if (!markUnread(db, userId, parsed.data.notificationId)) {
+        throw data("Notification not found", { status: 404 });
+      }
+      return { ok: true };
+    }
+    case "mark-all-read": {
+      markAllRead(db, userId);
       return { ok: true };
     }
   }

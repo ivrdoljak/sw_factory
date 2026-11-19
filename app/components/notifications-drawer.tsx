@@ -1,4 +1,4 @@
-import { useEffect, useState, type MouseEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { Link, useFetcher, useNavigate } from "react-router";
 import {
   Bell,
@@ -10,9 +10,15 @@ import {
   UserPlus,
 } from "lucide-react";
 import { NotificationEventKind, RefundStatus } from "~/db/schema";
-import type { NotificationForDisplay } from "~/lib/notifications.server";
+import type {
+  NotificationCursor,
+  NotificationFilter,
+  NotificationForDisplay,
+  NotificationPage,
+} from "~/lib/notifications.server";
 import type { loader as notificationsLoader } from "~/routes/api.notifications";
 import { cn, formatRelativeTime } from "~/lib/utils";
+import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
 import {
   Drawer,
@@ -29,12 +35,19 @@ import {
 
 const NOTIFICATIONS_ENDPOINT = "/api/notifications";
 
+const FILTERS: { value: NotificationFilter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "unread", label: "Unread" },
+];
+
 type NotificationsDrawerProps = { unreadCount: number };
 
 export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
   const [open, setOpen] = useState(false);
-  const notifications = useNotificationList(open);
+  const [filter, setFilter] = useState<NotificationFilter>("all");
+  const list = useNotificationList(open, filter);
   const markFetcher = useFetcher();
+  const markAllFetcher = useFetcher();
   const navigate = useNavigate();
 
   /**
@@ -58,12 +71,21 @@ export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
       setOpen(false);
     }
     if (!notification.read) {
+      list.setRead(notification.id, true);
       await markFetcher.submit(
         { intent: "mark-read", notificationId: notification.id },
         { method: "post", action: NOTIFICATIONS_ENDPOINT }
       );
     }
     if (!opensElsewhere) await navigate(notification.link);
+  }
+
+  function markAllRead() {
+    list.setAllRead();
+    void markAllFetcher.submit(
+      { intent: "mark-all-read" },
+      { method: "post", action: NOTIFICATIONS_ENDPOINT }
+    );
   }
 
   return (
@@ -85,26 +107,74 @@ export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
             Your newest Notifications. Opening one marks it read.
           </DrawerDescription>
         </DrawerHeader>
+        <div className="flex items-center gap-1 border-b px-5 py-2">
+          {FILTERS.map(({ value, label }) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={filter === value}
+              onClick={() => setFilter(value)}
+              className={cn(
+                "rounded-full px-3 py-1 text-xs font-medium transition-colors",
+                filter === value
+                  ? "bg-foreground text-background"
+                  : "hover:bg-accent"
+              )}
+            >
+              {value === "unread" ? `${label} (${unreadCount})` : label}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={markAllRead}
+            disabled={unreadCount === 0 || markAllFetcher.state !== "idle"}
+            className="ml-auto flex items-center gap-1 text-xs text-primary hover:underline disabled:text-muted-foreground disabled:no-underline"
+          >
+            <CheckCheck className="size-3.5" />
+            Mark all as read
+          </button>
+        </div>
         <div className="flex-1 overflow-y-auto">
-          {notifications === null ? (
+          {list.notifications === null ? (
             <NotificationListSkeleton />
-          ) : notifications.length === 0 ? (
-            <EmptyState>Nothing here yet.</EmptyState>
+          ) : list.notifications.length === 0 ? (
+            <EmptyState>
+              {filter === "unread"
+                ? "No unread Notifications."
+                : "Nothing here yet."}
+            </EmptyState>
           ) : (
-            groupByAge(notifications, Date.now()).map((group) => (
-              <section key={group.label}>
-                <h3 className="bg-muted/50 px-5 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  {group.label}
-                </h3>
-                {group.notifications.map((notification) => (
-                  <NotificationRow
-                    key={notification.id}
-                    notification={notification}
-                    onOpen={(event) => void openNotification(event, notification)}
-                  />
-                ))}
-              </section>
-            ))
+            <>
+              {groupByAge(list.notifications, Date.now()).map((group) => (
+                <section key={group.label}>
+                  <h3 className="bg-muted/50 px-5 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    {group.label}
+                  </h3>
+                  {group.notifications.map((notification) => (
+                    <NotificationRow
+                      key={notification.id}
+                      notification={notification}
+                      onOpen={(event) =>
+                        void openNotification(event, notification)
+                      }
+                      onMarked={(read) => list.setRead(notification.id, read)}
+                    />
+                  ))}
+                </section>
+              ))}
+              {list.hasOlder && (
+                <div className="flex justify-center px-5 py-4">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={list.loadOlder}
+                    disabled={list.loadingOlder}
+                  >
+                    {list.loadingOlder ? "Loading…" : "Load older"}
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </div>
       </DrawerContent>
@@ -112,30 +182,127 @@ export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
   );
 }
 
-/**
- * The drawer's list: null until the newest page has loaded. Every opening
- * loads it afresh, and opening marks nothing read.
- */
-function useNotificationList(open: boolean): NotificationForDisplay[] | null {
-  const fetcher = useFetcher<typeof notificationsLoader>();
-  const { load } = fetcher;
-  const [notifications, setNotifications] = useState<
-    NotificationForDisplay[] | null
-  >(null);
+type NotificationListState = Omit<NotificationPage, "notifications"> & {
+  /** Null while the newest page for the filter is loading. */
+  notifications: NotificationForDisplay[] | null;
+};
 
+const LOADING: NotificationListState = { notifications: null, hasOlder: false };
+
+/**
+ * The drawer's list for the current filter. Every opening, and every switch of
+ * filter, loads the newest page afresh; opening marks nothing read. "Load
+ * older" appends the next page, by the cursor of the oldest one shown.
+ *
+ * After any mark, React Router reloads each fetcher's last page. Pages are
+ * therefore merged by id, never replacing what's shown, and marks change the
+ * list here straight away rather than waiting for those reloads.
+ */
+function useNotificationList(open: boolean, filter: NotificationFilter) {
+  const newestFetcher = useFetcher<typeof notificationsLoader>();
+  const olderFetcher = useFetcher<typeof notificationsLoader>();
+  const [state, setState] = useState<NotificationListState>(LOADING);
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
+
+  const { load: loadNewest } = newestFetcher;
   useEffect(() => {
     if (!open) return;
-    setNotifications(null);
-    void load(NOTIFICATIONS_ENDPOINT);
-  }, [open, load]);
+    setState(LOADING);
+    void loadNewest(listUrl(filter));
+  }, [open, filter, loadNewest]);
 
-  // The newest page replaces the list. Older pages and newer arrivals will
-  // merge in here rather than replace it.
+  // Each page is handled once, when it arrives. One loaded for another filter
+  // is dropped, and an older page only extends a list already shown.
   useEffect(() => {
-    if (fetcher.data) setNotifications(fetcher.data.notifications);
-  }, [fetcher.data]);
+    const page = newestFetcher.data;
+    if (!page || page.filter !== filterRef.current) return;
+    setState((list) =>
+      list.notifications === null ? page : mergePage(shown(list), page)
+    );
+  }, [newestFetcher.data]);
+  useEffect(() => {
+    const page = olderFetcher.data;
+    if (!page || page.filter !== filterRef.current) return;
+    setState((list) =>
+      list.notifications === null ? list : mergePage(shown(list), page)
+    );
+  }, [olderFetcher.data]);
 
-  return notifications;
+  function loadOlder() {
+    const oldest = state.notifications?.at(-1);
+    if (oldest) void olderFetcher.load(listUrl(filter, oldest));
+  }
+
+  function setRead(id: number, read: boolean) {
+    setState((list) => ({
+      ...list,
+      notifications:
+        list.notifications?.map((n) => (n.id === id ? { ...n, read } : n)) ??
+        null,
+    }));
+  }
+
+  /** Under Unread nothing is left to show; under All everything turns read. */
+  function setAllRead() {
+    setState((list) =>
+      filterRef.current === "unread"
+        ? { notifications: [], hasOlder: false }
+        : {
+            ...list,
+            notifications:
+              list.notifications?.map((n) => ({ ...n, read: true })) ?? null,
+          }
+    );
+  }
+
+  return {
+    notifications: state.notifications,
+    hasOlder: state.hasOlder,
+    loadingOlder: olderFetcher.state === "loading",
+    loadOlder,
+    setRead,
+    setAllRead,
+  };
+}
+
+function shown({ notifications, hasOlder }: NotificationListState): NotificationPage {
+  return { notifications: notifications ?? [], hasOlder };
+}
+
+function listUrl(filter: NotificationFilter, before?: NotificationCursor) {
+  const params = new URLSearchParams({ filter });
+  if (before) {
+    params.set("beforeRaisedAt", before.raisedAt);
+    params.set("beforeId", String(before.id));
+  }
+  return `${NOTIFICATIONS_ENDPOINT}?${params}`;
+}
+
+/** Newest first, by the (raisedAt, id) pair the server sorts by. */
+function newestFirst(a: NotificationCursor, b: NotificationCursor): number {
+  if (a.raisedAt !== b.raisedAt) return a.raisedAt < b.raisedAt ? 1 : -1;
+  return b.id - a.id;
+}
+
+/**
+ * Adds a page to the list shown, updating the Notifications it already has.
+ * Nothing shown is removed. Whether older ones exist is taken from the page
+ * only when it reaches the bottom of the list.
+ */
+function mergePage(list: NotificationPage, page: NotificationPage): NotificationPage {
+  const byId = new Map(list.notifications.map((n) => [n.id, n]));
+  for (const notification of page.notifications) {
+    byId.set(notification.id, notification);
+  }
+  const notifications = [...byId.values()].sort(newestFirst);
+  const oldest = notifications.at(-1);
+  const reachesBottom =
+    oldest !== undefined && page.notifications.some((n) => n.id === oldest.id);
+  return {
+    notifications,
+    hasOlder: reachesBottom ? page.hasOlder : list.hasOlder,
+  };
 }
 
 /** The unread badge: hidden at zero, "9+" above nine. */
@@ -220,11 +387,29 @@ const REFUND_STATUS_TAGS: Record<
 function NotificationRow({
   notification,
   onOpen,
+  onMarked,
 }: {
   notification: NotificationForDisplay;
   onOpen: (event: MouseEvent<HTMLAnchorElement>) => void;
+  /** Called as soon as the row is marked read or unread from its hover link. */
+  onMarked: (read: boolean) => void;
 }) {
+  // Each row marks through its own fetcher, so quick marks on several rows
+  // don't cancel one another.
+  const markFetcher = useFetcher();
   const unread = !notification.read;
+
+  /** Toggles read and unread without opening the Notification. */
+  function toggleRead() {
+    onMarked(unread);
+    void markFetcher.submit(
+      {
+        intent: unread ? "mark-read" : "mark-unread",
+        notificationId: notification.id,
+      },
+      { method: "post", action: NOTIFICATIONS_ENDPOINT }
+    );
+  }
   const statusTag = notification.refundStatus
     ? REFUND_STATUS_TAGS[notification.refundStatus]
     : null;
@@ -271,6 +456,13 @@ function NotificationRow({
           <time dateTime={notification.raisedAt} suppressHydrationWarning>
             {formatRelativeTime(notification.raisedAt)}
           </time>
+          <button
+            type="button"
+            onClick={toggleRead}
+            className="relative z-10 opacity-0 transition-opacity hover:text-foreground hover:underline focus-visible:opacity-100 group-hover:opacity-100"
+          >
+            {unread ? "Mark as read" : "Mark as unread"}
+          </button>
         </div>
       </div>
     </article>
