@@ -394,6 +394,208 @@ describe("a new question", () => {
   });
 });
 
+describe("a new reply", () => {
+  let lessonId: number;
+
+  beforeEach(() => {
+    const moduleId = db
+      .insert(schema.modules)
+      .values({ courseId: base.course.id, title: "Basics", position: 1 })
+      .returning()
+      .get().id;
+    lessonId = db
+      .insert(schema.lessons)
+      .values({ moduleId, title: "Closures", position: 1 })
+      .returning()
+      .get().id;
+  });
+
+  function addPerson(name: string) {
+    return db
+      .insert(schema.users)
+      .values({
+        name,
+        email: `${name.toLowerCase().replaceAll(" ", ".")}@example.com`,
+        role: UserRole.Student,
+      })
+      .returning()
+      .get();
+  }
+
+  /** Posts a top-level comment on the lesson, raising nothing. */
+  function question(authorId: number, body = "How do closures work?") {
+    return db
+      .insert(schema.comments)
+      .values({ userId: authorId, lessonId, parentId: null, body })
+      .returning()
+      .get().id;
+  }
+
+  /** Posts a reply in the question's thread and raises its Notification Event. */
+  function reply(
+    questionId: number,
+    authorId: number,
+    body = "A closure keeps its scope."
+  ) {
+    return db.transaction((tx) => {
+      const comment = tx
+        .insert(schema.comments)
+        .values({ userId: authorId, lessonId, parentId: questionId, body })
+        .returning()
+        .get();
+      notify(tx, {
+        kind: NotificationEventKind.NewReply,
+        actorId: authorId,
+        commentId: comment.id,
+        raisedAt: NOW,
+      });
+      return comment.id;
+    });
+  }
+
+  it("notifies the question's author, linking to the reply and showing its excerpt", () => {
+    const questionId = question(base.user.id, "How do closures work?");
+    const replyId = reply(
+      questionId,
+      base.instructor.id,
+      "A **closure** keeps its scope."
+    );
+
+    expect(listNotifications(db, base.user.id)).toEqual([
+      {
+        id: expect.any(Number),
+        kind: NotificationEventKind.NewReply,
+        title: "Test Instructor replied on Closures",
+        link: `/courses/test-course/lessons/${lessonId}#comment-${replyId}`,
+        detail: "A closure keeps its scope.",
+        refundStatus: null,
+        raisedAt: NOW.toISOString(),
+        read: false,
+      },
+    ]);
+    expect(countUnread(db, base.user.id)).toBe(1);
+  });
+
+  it("notifies the question's author and every earlier replier, each once", () => {
+    const sam = addPerson("Sam Student");
+    const kim = addPerson("Kim Student");
+    const questionId = question(base.user.id);
+    reply(questionId, sam.id);
+    reply(questionId, sam.id);
+    reply(questionId, base.user.id);
+
+    reply(questionId, kim.id, "Same question here.");
+
+    for (const participant of [base.user, sam]) {
+      expect(listNotifications(db, participant.id)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            title: "Kim Student replied on Closures",
+            detail: "Same question here.",
+          }),
+        ])
+      );
+      expect(
+        listNotifications(db, participant.id).filter(
+          (notification) => notification.title === "Kim Student replied on Closures"
+        )
+      ).toHaveLength(1);
+    }
+  });
+
+  it("never notifies the replier, even when they asked the question", () => {
+    const sam = addPerson("Sam Student");
+    const questionId = question(base.user.id);
+    reply(questionId, sam.id, "Have you read the docs?");
+
+    reply(questionId, base.user.id, "Yes, still stuck.");
+
+    expect(listNotifications(db, base.user.id)).toEqual([
+      expect.objectContaining({ title: "Sam Student replied on Closures" }),
+    ]);
+    expect(listNotifications(db, sam.id)).toMatchObject([
+      { title: "Test User replied on Closures", detail: "Yes, still stuck." },
+    ]);
+  });
+
+  it("still notifies people whose comments in the thread were deleted", () => {
+    const sam = addPerson("Sam Student");
+    const questionId = question(base.user.id);
+    const samsReplyId = reply(questionId, sam.id);
+    db.update(schema.comments)
+      .set({ deletedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, questionId))
+      .run();
+    db.update(schema.comments)
+      .set({ deletedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, samsReplyId))
+      .run();
+
+    reply(questionId, base.instructor.id, "Answering anyway.");
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { title: "Test Instructor replied on Closures" },
+      { title: "Sam Student replied on Closures" },
+    ]);
+    expect(listNotifications(db, sam.id)).toMatchObject([
+      { title: "Test Instructor replied on Closures" },
+    ]);
+  });
+
+  it("notifies nobody outside the thread", () => {
+    const sam = addPerson("Sam Student");
+    question(sam.id, "A different question.");
+    const questionId = question(base.user.id);
+
+    reply(questionId, base.instructor.id);
+
+    expect(listNotifications(db, sam.id)).toEqual([]);
+    expect(countUnread(db, sam.id)).toBe(0);
+  });
+
+  it("shows the reply as edited", () => {
+    const questionId = question(base.user.id);
+    const replyId = reply(questionId, base.instructor.id, "Use a closure.");
+    db.update(schema.comments)
+      .set({ body: "Use a `let` binding.", editedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, replyId))
+      .run();
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { detail: "Use a let binding." },
+    ]);
+  });
+
+  it("cuts a long reply to about 140 characters", () => {
+    const questionId = question(base.user.id);
+    const words = Array.from({ length: 60 }, (_, i) => `word${i}`).join(" ");
+    reply(questionId, base.instructor.id, words);
+
+    const [notification] = listNotifications(db, base.user.id);
+    const detail = notification?.detail ?? "";
+    expect(detail.length).toBeLessThanOrEqual(141);
+    expect(detail.length).toBeGreaterThan(120);
+    expect(detail.endsWith("…")).toBe(true);
+  });
+
+  it("says the reply was deleted, still linking to its spot in the thread", () => {
+    const questionId = question(base.user.id);
+    const replyId = reply(questionId, base.instructor.id);
+    db.update(schema.comments)
+      .set({ deletedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, replyId))
+      .run();
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      {
+        title: "Test Instructor replied on Closures",
+        link: `/courses/test-course/lessons/${lessonId}#comment-${replyId}`,
+        detail: "This comment was deleted.",
+      },
+    ]);
+  });
+});
+
 describe("a claimed Seat", () => {
   function addPerson(name: string) {
     return db
