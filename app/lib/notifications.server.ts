@@ -3,8 +3,11 @@ import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { alias } from "drizzle-orm/sqlite-core";
 import * as schema from "~/db/schema";
 import {
+  comments,
   coupons,
   courses,
+  lessons,
+  modules,
   notifications,
   purchases,
   refunds,
@@ -13,6 +16,8 @@ import {
   RefundStatus,
   UserRole,
 } from "~/db/schema";
+import { commentExcerpt } from "~/lib/comment-markdown.server";
+import { commentAnchorId } from "~/lib/comments";
 
 // ─── Notifications ───
 // The only code that reads or writes Notifications (docs/adr/0013, spec #18).
@@ -60,11 +65,20 @@ type SeatClaimedEvent = {
   raisedAt: Date;
 };
 
+type NewQuestionEvent = {
+  kind: NotificationEventKind.NewQuestion;
+  /** Whoever asked: the author of the top-level comment. */
+  actorId: number;
+  commentId: number;
+  raisedAt: Date;
+};
+
 /** A Notification Event with its facts: which kind, who acted, and the ids involved. */
 export type NotificationEvent =
   | RefundDecisionEvent
   | RefundRequestRaisedEvent
-  | SeatClaimedEvent;
+  | SeatClaimedEvent
+  | NewQuestionEvent;
 
 // ─── Write side ───
 
@@ -119,6 +133,8 @@ function findDelivery(tx: Tx, event: NotificationEvent): Delivery {
       return refundRequestRaisedDelivery(tx, event);
     case NotificationEventKind.SeatClaimed:
       return seatClaimedDelivery(tx, event);
+    case NotificationEventKind.NewQuestion:
+      return newQuestionDelivery(tx, event);
   }
 }
 
@@ -212,6 +228,33 @@ function seatClaimedDelivery(tx: Tx, event: SeatClaimedEvent): Delivery {
   };
 }
 
+/** A question on a lesson goes to the course's Instructor. */
+function newQuestionDelivery(tx: Tx, event: NewQuestionEvent): Delivery {
+  const found = tx
+    .select({
+      lessonId: lessons.id,
+      courseId: courses.id,
+      instructorId: courses.instructorId,
+    })
+    .from(comments)
+    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .innerJoin(courses, eq(modules.courseId, courses.id))
+    .where(eq(comments.id, event.commentId))
+    .get();
+
+  if (!found) return NOBODY;
+
+  return {
+    recipientIds: [found.instructorId],
+    references: {
+      courseId: found.courseId,
+      lessonId: found.lessonId,
+      commentId: event.commentId,
+    },
+  };
+}
+
 // ─── Read side ───
 
 /** A Notification ready to display. */
@@ -236,6 +279,8 @@ function selectNotifications(db: Queryable) {
       notification: notifications,
       actor: { name: actors.name },
       course: { title: courses.title, slug: courses.slug },
+      lesson: { title: lessons.title },
+      comment: { body: comments.body, deletedAt: comments.deletedAt },
       refundRequest: {
         status: refunds.status,
         decisionNote: refunds.decisionNote,
@@ -244,6 +289,8 @@ function selectNotifications(db: Queryable) {
     .from(notifications)
     .leftJoin(actors, eq(notifications.actorId, actors.id))
     .leftJoin(courses, eq(notifications.courseId, courses.id))
+    .leftJoin(lessons, eq(notifications.lessonId, lessons.id))
+    .leftJoin(comments, eq(notifications.commentId, comments.id))
     .leftJoin(refunds, eq(notifications.refundRequestId, refunds.id));
 }
 
@@ -314,8 +361,9 @@ function renderKind(row: NotificationRow): Rendered | null {
       return renderRefundRequestRaised(row);
     case NotificationEventKind.SeatClaimed:
       return renderSeatClaimed(row);
-    // Not raised yet: each gets its renderer with the ticket that raises it.
     case NotificationEventKind.NewQuestion:
+      return renderNewQuestion(row);
+    // Not raised yet: each gets its renderer with the ticket that raises it.
     case NotificationEventKind.NewReply:
       return null;
   }
@@ -372,4 +420,38 @@ function courseTitle(row: NotificationRow): string {
 function refundDecisionLink(row: NotificationRow): string {
   if (row.notification.teamLicenceId !== null) return "/team";
   return row.course ? `/courses/${row.course.slug}` : "/courses";
+}
+
+function renderNewQuestion(row: NotificationRow): Rendered {
+  return {
+    title: `${actorName(row)} asked a question on ${lessonTitle(row)}`,
+    link: commentLink(row),
+    detail: commentDetail(row),
+    refundStatus: null,
+  };
+}
+
+/**
+ * The inline detail for a Notification about a comment (a question or a
+ * reply): the comment as it reads now, as a short plain-text excerpt.
+ */
+function commentDetail(row: NotificationRow): string {
+  if (!row.comment || row.comment.deletedAt !== null) {
+    return "This comment was deleted.";
+  }
+  return commentExcerpt(row.comment.body);
+}
+
+function lessonTitle(row: NotificationRow): string {
+  return row.lesson?.title ?? "a lesson";
+}
+
+/** The lesson page, at the comment's anchor. */
+function commentLink(row: NotificationRow): string {
+  const { lessonId, commentId } = row.notification;
+  if (!row.course || lessonId === null) return "/courses";
+  const lessonPage = `/courses/${row.course.slug}/lessons/${lessonId}`;
+  return commentId === null
+    ? lessonPage
+    : `${lessonPage}#${commentAnchorId(commentId)}`;
 }

@@ -12,10 +12,8 @@ import { Textarea } from "~/components/ui/textarea";
 import { UserAvatar } from "~/components/user-avatar";
 import { AlertTriangle, CheckCircle2, ExternalLink } from "lucide-react";
 import { cn, daysSince, formatRelativeTime } from "~/lib/utils";
-import {
-  MAX_COMMENT_LENGTH,
-  postLessonComment,
-} from "~/lib/comments";
+import { MAX_COMMENT_LENGTH } from "~/lib/comments";
+import { postLessonCommentAndNotify } from "~/lib/comments.server";
 import { parseFormData } from "~/lib/validation";
 import { db } from "~/db";
 import {
@@ -167,12 +165,15 @@ export async function action({ request }: Route.ActionArgs) {
 
   // Answering as the course's voice — so it must be the course's own
   // instructor, or an admin.
-  const access = await requireStaff(request, course.courseId);
+  const { userId } = await requireStaff(request, course.courseId);
+  if (userId === null) {
+    throw data("Select a user from the DevUI panel.", { status: 401 });
+  }
 
   try {
-    postLessonComment(
+    postLessonCommentAndNotify(
       db,
-      access.userId!,
+      userId,
       question.lessonId,
       question.id,
       parsed.data.body
