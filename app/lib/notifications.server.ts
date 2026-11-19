@@ -1,5 +1,6 @@
 import { and, count, desc, eq, isNull } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import { alias } from "drizzle-orm/sqlite-core";
 import * as schema from "~/db/schema";
 import {
   coupons,
@@ -7,6 +8,7 @@ import {
   notifications,
   purchases,
   refunds,
+  users,
   NotificationEventKind,
   RefundStatus,
 } from "~/db/schema";
@@ -41,8 +43,16 @@ type RefundDecisionEvent = {
   raisedAt: Date;
 };
 
+type SeatClaimedEvent = {
+  kind: NotificationEventKind.SeatClaimed;
+  /** The Student who claimed the Seat. */
+  actorId: number;
+  seatId: number;
+  raisedAt: Date;
+};
+
 /** A Notification Event with its facts: which kind, who acted, and the ids involved. */
-export type NotificationEvent = RefundDecisionEvent;
+export type NotificationEvent = RefundDecisionEvent | SeatClaimedEvent;
 
 // ─── Write side ───
 
@@ -93,6 +103,8 @@ function findDelivery(tx: Tx, event: NotificationEvent): Delivery {
       return refundDecisionDelivery(tx, event);
     case NotificationEventKind.RefundRequestDeclined:
       return refundDecisionDelivery(tx, event);
+    case NotificationEventKind.SeatClaimed:
+      return seatClaimedDelivery(tx, event);
   }
 }
 
@@ -131,6 +143,27 @@ function refundDecisionDelivery(
   };
 }
 
+/** A claimed Seat goes to the Team Admin who bought its Team Licence. */
+function seatClaimedDelivery(tx: Tx, event: SeatClaimedEvent): Delivery {
+  const found = tx
+    .select({ teamLicence: purchases })
+    .from(coupons)
+    .innerJoin(purchases, eq(coupons.purchaseId, purchases.id))
+    .where(eq(coupons.id, event.seatId))
+    .get();
+
+  if (!found) return NOBODY;
+
+  const { teamLicence } = found;
+  return {
+    recipientIds: [teamLicence.userId],
+    references: {
+      courseId: teamLicence.courseId,
+      teamLicenceId: teamLicence.id,
+    },
+  };
+}
+
 // ─── Read side ───
 
 /** A Notification ready to display. */
@@ -147,10 +180,13 @@ export type NotificationForDisplay = {
   read: boolean;
 };
 
+const actors = alias(users, "actors");
+
 function selectNotifications(db: Queryable) {
   return db
     .select({
       notification: notifications,
+      actor: { name: actors.name },
       course: { title: courses.title, slug: courses.slug },
       refundRequest: {
         status: refunds.status,
@@ -158,6 +194,7 @@ function selectNotifications(db: Queryable) {
       },
     })
     .from(notifications)
+    .leftJoin(actors, eq(notifications.actorId, actors.id))
     .leftJoin(courses, eq(notifications.courseId, courses.id))
     .leftJoin(refunds, eq(notifications.refundRequestId, refunds.id));
 }
@@ -225,9 +262,10 @@ function renderKind(row: NotificationRow): Rendered | null {
       return renderRefundRequestApproved(row);
     case NotificationEventKind.RefundRequestDeclined:
       return renderRefundRequestDeclined(row);
+    case NotificationEventKind.SeatClaimed:
+      return renderSeatClaimed(row);
     // Not raised yet: each gets its renderer with the ticket that raises it.
     case NotificationEventKind.RefundRequestRaised:
-    case NotificationEventKind.SeatClaimed:
     case NotificationEventKind.NewQuestion:
     case NotificationEventKind.NewReply:
       return null;
@@ -251,6 +289,19 @@ function renderRefundRequestDeclined(row: NotificationRow): Rendered {
     detail: row.refundRequest?.decisionNote ?? null,
     refundStatus: null,
   };
+}
+
+function renderSeatClaimed(row: NotificationRow): Rendered {
+  return {
+    title: `${actorName(row)} claimed a Seat on ${courseTitle(row)}`,
+    link: "/team",
+    detail: null,
+    refundStatus: null,
+  };
+}
+
+function actorName(row: NotificationRow): string {
+  return row.actor?.name ?? "Someone";
 }
 
 function courseTitle(row: NotificationRow): string {
