@@ -29,6 +29,54 @@ export type RenderedComment = {
   replies: RenderedComment[];
 };
 
+// ─── Deleted comments ───
+// A deleted comment shows as "This comment was deleted." only while replies
+// under it still show. Otherwise it's hidden, but its anchor stays at its spot
+// in the thread, so a Notification's `#comment-<id>` link still lands there.
+// The anchor is an empty element placed inside the next comment shown, or
+// after the list, so the list's borders and spacing don't change.
+
+function isShown(comment: RenderedComment): boolean {
+  return !comment.deleted || comment.replies.some(isShown);
+}
+
+/** The ids of a hidden comment and of everything under it. */
+function anchorIds(comment: RenderedComment): number[] {
+  return [comment.id, ...comment.replies.flatMap(anchorIds)];
+}
+
+type ShownComment = {
+  comment: RenderedComment;
+  /** Hidden comments between this one and the comment shown before it. */
+  anchorsBefore: number[];
+};
+
+/** The comments to show, with the anchors of the hidden ones placed among them. */
+function placeAnchors(comments: RenderedComment[]): {
+  shown: ShownComment[];
+  /** Hidden comments after the last one shown. */
+  anchorsAfter: number[];
+} {
+  const shown: ShownComment[] = [];
+  let pending: number[] = [];
+  for (const comment of comments) {
+    if (isShown(comment)) {
+      shown.push({ comment, anchorsBefore: pending });
+      pending = [];
+    } else {
+      pending.push(...anchorIds(comment));
+    }
+  }
+  return { shown, anchorsAfter: pending };
+}
+
+/** Empty, zero-height anchors for hidden comments. */
+function HiddenAnchors({ ids }: { ids: number[] }) {
+  return ids.map((id) => (
+    <div key={id} id={commentAnchorId(id)} aria-hidden="true" />
+  ));
+}
+
 function AuthorBadge({ label }: { label: string }) {
   return (
     <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
@@ -192,12 +240,14 @@ function CommentActions({
 
 function CommentItem({
   comment,
+  anchorsBefore,
   currentUserId,
   canModerate,
   canPost,
   isReply,
 }: {
   comment: RenderedComment;
+  anchorsBefore: number[];
   currentUserId: number | null;
   canModerate: boolean;
   canPost: boolean;
@@ -211,6 +261,7 @@ function CommentItem({
   if (comment.deleted) {
     return (
       <div id={commentAnchorId(comment.id)} className="py-3">
+        <HiddenAnchors ids={anchorsBefore} />
         <p className="text-sm italic text-muted-foreground">
           This comment was deleted.
         </p>
@@ -229,6 +280,7 @@ function CommentItem({
       id={commentAnchorId(comment.id)}
       className={cn("py-3", isReply && "border-l pl-4")}
     >
+      <HiddenAnchors ids={anchorsBefore} />
       <div className="flex items-start gap-3">
         <UserAvatar
           name={comment.author.name}
@@ -323,21 +375,27 @@ function Replies({
   canModerate: boolean;
   canPost: boolean;
 }) {
-  if (comment.replies.length === 0) return null;
+  const { shown, anchorsAfter } = placeAnchors(comment.replies);
 
   return (
-    <div className="ml-11 mt-1 space-y-1">
-      {comment.replies.map((reply) => (
-        <CommentItem
-          key={reply.id}
-          comment={reply}
-          currentUserId={currentUserId}
-          canModerate={canModerate}
-          canPost={canPost}
-          isReply
-        />
-      ))}
-    </div>
+    <>
+      {shown.length > 0 && (
+        <div className="ml-11 mt-1 space-y-1">
+          {shown.map(({ comment: reply, anchorsBefore }) => (
+            <CommentItem
+              key={reply.id}
+              comment={reply}
+              anchorsBefore={anchorsBefore}
+              currentUserId={currentUserId}
+              canModerate={canModerate}
+              canPost={canPost}
+              isReply
+            />
+          ))}
+        </div>
+      )}
+      <HiddenAnchors ids={anchorsAfter} />
+    </>
   );
 }
 
@@ -355,6 +413,8 @@ export function CommentThread({
   canPost: boolean;
   instructorName: string;
 }) {
+  const { shown, anchorsAfter } = placeAnchors(comments);
+
   return (
     <Card className="mb-8">
       <CardContent className="p-6">
@@ -363,7 +423,7 @@ export function CommentThread({
           <h2 className="text-xl font-semibold">Questions &amp; Discussion</h2>
         </div>
 
-        {comments.length === 0 ? (
+        {shown.length === 0 ? (
           <div className="rounded-lg border border-dashed p-6 text-center">
             <p className="font-medium">Stuck on this lesson?</p>
             <p className="mt-1 text-sm text-muted-foreground">
@@ -373,10 +433,11 @@ export function CommentThread({
           </div>
         ) : (
           <div className="divide-y">
-            {comments.map((comment) => (
+            {shown.map(({ comment, anchorsBefore }) => (
               <CommentItem
                 key={comment.id}
                 comment={comment}
+                anchorsBefore={anchorsBefore}
                 currentUserId={currentUserId}
                 canModerate={canModerate}
                 canPost={canPost}
@@ -385,6 +446,7 @@ export function CommentThread({
             ))}
           </div>
         )}
+        <HiddenAnchors ids={anchorsAfter} />
 
         {canPost && (
           <div className="mt-6 border-t pt-6">

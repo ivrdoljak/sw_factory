@@ -384,12 +384,13 @@ function getLessonThread(lessonId: number): ThreadComment[] {
   }
 
   for (const row of rows) {
-    if (row.parentId === null || row.deletedAt !== null) continue;
+    if (row.parentId === null) continue;
     byId.get(row.parentId)?.replies.push(toThreadComment(row));
   }
 
-  // A deleted question with no replies left has nothing worth showing.
-  return topLevel.filter((c) => !c.deleted || c.replies.length > 0);
+  // Deleted comments are kept, emptied, so CommentThread can keep their spot
+  // for Notification links while showing only what's worth showing.
+  return topLevel;
 }
 
 function updateComment(commentId: number, userId: number, body: string) {
