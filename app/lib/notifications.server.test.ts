@@ -5,8 +5,11 @@ import { NotificationEventKind, RefundStatus, UserRole } from "~/db/schema";
 import { eq } from "drizzle-orm";
 import {
   countUnread,
+  markAllRead,
+  listNotificationPage,
   listNotifications,
   markRead,
+  markUnread,
   notify,
 } from "./notifications.server";
 
@@ -151,6 +154,36 @@ describe("marking a Notification read", () => {
     });
     expect(countUnread(db, base.user.id)).toBe(2);
   });
+
+  it("can be undone by marking it unread, which puts it back in the count and the Unread filter", () => {
+    const { newest, other } = twoDeclinedRefundRequests();
+    markRead(db, base.user.id, newest.id);
+    markRead(db, base.user.id, other.id);
+
+    expect(markUnread(db, base.user.id, newest.id)).toBe(true);
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { id: newest.id, read: false },
+      { id: other.id, read: true },
+    ]);
+    expect(countUnread(db, base.user.id)).toBe(1);
+    expect(
+      listNotifications(db, base.user.id, { filter: "unread" }).map((n) => n.id)
+    ).toEqual([newest.id]);
+  });
+
+  it("can't be undone on someone else's Notification", () => {
+    const { newest } = twoDeclinedRefundRequests();
+    markRead(db, base.user.id, newest.id);
+
+    expect(markUnread(db, base.instructor.id, newest.id)).toBe(false);
+
+    expect(listNotifications(db, base.user.id)[0]).toMatchObject({
+      id: newest.id,
+      read: true,
+    });
+    expect(countUnread(db, base.user.id)).toBe(1);
+  });
 });
 
 function hoursBefore(hours: number) {
@@ -179,6 +212,148 @@ describe("the drawer's list", () => {
     ].map((hours) => hoursBefore(hours).toISOString());
     expect(listed.map((n) => n.raisedAt)).toEqual(newestTwenty);
     expect(countUnread(db, base.user.id)).toBe(25);
+  });
+});
+
+/** Declined Refund Requests for the Student, raised the given hours ago, in that order. */
+function declinedHoursAgo(hoursAgo: number[]) {
+  db.transaction((tx) => {
+    for (const hours of hoursAgo) {
+      const refundRequestId = declinedRefundRequest(base.user.id);
+      notify(tx, declined(refundRequestId, platformAdmin.id, hoursBefore(hours)));
+    }
+  });
+}
+
+function hoursAgoOf(listed: { raisedAt: string }[]) {
+  return listed.map(
+    (n) => (NOW.getTime() - Date.parse(n.raisedAt)) / (60 * 60 * 1000)
+  );
+}
+
+describe("the Unread filter", () => {
+  it("lists only unread Notifications, newest first", () => {
+    declinedHoursAgo([1, 2, 3, 4]);
+    const [, twoHoursAgo, , fourHoursAgo] = listNotifications(db, base.user.id);
+    markRead(db, base.user.id, twoHoursAgo.id);
+    markRead(db, base.user.id, fourHoursAgo.id);
+
+    const unread = listNotifications(db, base.user.id, { filter: "unread" });
+
+    expect(hoursAgoOf(unread)).toEqual([1, 3]);
+    expect(unread.every((n) => !n.read)).toBe(true);
+  });
+
+  it("lists nothing once everything is read", () => {
+    declinedHoursAgo([1]);
+    const [only] = listNotifications(db, base.user.id);
+    markRead(db, base.user.id, only.id);
+
+    expect(listNotifications(db, base.user.id, { filter: "unread" })).toEqual([]);
+  });
+});
+
+describe("marking all Notifications read", () => {
+  it("marks every unread Notification read, including ones not loaded yet", () => {
+    // 25 unread: the drawer's first page shows only the newest 20.
+    declinedHoursAgo(Array.from({ length: 25 }, (_, hours) => hours));
+    const loaded = listNotificationPage(db, base.user.id);
+    expect(loaded.hasOlder).toBe(true);
+
+    markAllRead(db, base.user.id);
+
+    expect(countUnread(db, base.user.id)).toBe(0);
+    expect(listNotifications(db, base.user.id, { filter: "unread" })).toEqual([]);
+    const older = listNotifications(db, base.user.id, {
+      before: loaded.notifications[19],
+    });
+    expect(older).toHaveLength(5);
+    expect(older.every((n) => n.read)).toBe(true);
+  });
+
+  it("leaves other people's Notifications unread", () => {
+    declinedHoursAgo([1, 2]);
+    const otherStudent = db
+      .insert(schema.users)
+      .values({ name: "Other Student", email: "other@example.com", role: UserRole.Student })
+      .returning()
+      .get();
+    db.transaction((tx) => {
+      const refundRequestId = declinedRefundRequest(otherStudent.id);
+      notify(tx, declined(refundRequestId, platformAdmin.id));
+    });
+
+    markAllRead(db, base.user.id);
+
+    expect(countUnread(db, otherStudent.id)).toBe(1);
+    expect(listNotifications(db, otherStudent.id)).toMatchObject([{ read: false }]);
+  });
+});
+
+describe("Load older", () => {
+  it("fetches the next 20 after the oldest one shown, and says when none are left", () => {
+    // 25 raised out of order, hours 0 to 24 ago.
+    declinedHoursAgo([
+      3, 24, 0, 21, 7, 12, 1, 23, 18, 5, 22, 9, 2, 19, 14, 6, 20, 4, 11, 15,
+      16, 8, 17, 10, 13,
+    ]);
+
+    const newest = listNotificationPage(db, base.user.id);
+    expect(hoursAgoOf(newest.notifications)).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    ]);
+    expect(newest.hasOlder).toBe(true);
+
+    const older = listNotificationPage(db, base.user.id, {
+      before: newest.notifications[19],
+    });
+    expect(hoursAgoOf(older.notifications)).toEqual([20, 21, 22, 23, 24]);
+    expect(older.hasOlder).toBe(false);
+  });
+
+  it("doesn't offer more when the newest page holds exactly 20", () => {
+    declinedHoursAgo(Array.from({ length: 20 }, (_, hours) => hours));
+
+    expect(listNotificationPage(db, base.user.id).hasOlder).toBe(false);
+  });
+
+  it("neither skips nor repeats Notifications raised at the same moment across pages", () => {
+    // 22 raised at the same moment: the page boundary falls among them.
+    declinedHoursAgo(Array.from({ length: 22 }, () => 5));
+
+    const newest = listNotificationPage(db, base.user.id);
+    const older = listNotificationPage(db, base.user.id, {
+      before: newest.notifications[19],
+    });
+
+    const ids = [...newest.notifications, ...older.notifications].map((n) => n.id);
+    expect(older.notifications).toHaveLength(2);
+    expect(new Set(ids).size).toBe(22);
+    expect(older.hasOlder).toBe(false);
+  });
+
+  it("pages through only unread Notifications under the Unread filter", () => {
+    // 30 unread, hours 0 to 29 ago.
+    declinedHoursAgo(Array.from({ length: 30 }, (_, hours) => hours));
+    const all = listNotifications(db, base.user.id, { limit: 30 });
+    // Read before the first page: hours 2 and 25.
+    markRead(db, base.user.id, all[2].id);
+    markRead(db, base.user.id, all[25].id);
+
+    const newest = listNotificationPage(db, base.user.id, { filter: "unread" });
+    expect(hoursAgoOf(newest.notifications)).toEqual([
+      0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    ]);
+
+    // Read while the first page is shown: hour 27, not loaded yet.
+    markRead(db, base.user.id, all[27].id);
+
+    const older = listNotificationPage(db, base.user.id, {
+      filter: "unread",
+      before: newest.notifications[19],
+    });
+    expect(hoursAgoOf(older.notifications)).toEqual([21, 22, 23, 24, 26, 28, 29]);
+    expect(older.hasOlder).toBe(false);
   });
 });
 
@@ -242,6 +417,24 @@ describe("checking for newer Notifications", () => {
     expect(
       listNotifications(db, base.user.id, { newerThan: newestShown })
     ).toEqual([]);
+  });
+
+  it("brings only unread arrivals under the Unread filter", () => {
+    raiseDeclined(hoursBefore(5));
+    const [newestShown] = listNotifications(db, base.user.id, {
+      filter: "unread",
+    });
+    raiseDeclined(hoursBefore(2));
+    raiseDeclined(hoursBefore(1));
+    const [oneHourAgo] = listNotifications(db, base.user.id);
+    markRead(db, base.user.id, oneHourAgo.id);
+
+    const newer = listNotifications(db, base.user.id, {
+      filter: "unread",
+      newerThan: newestShown,
+    });
+
+    expect(newer.map((n) => n.raisedAt)).toEqual([hoursBefore(2).toISOString()]);
   });
 });
 

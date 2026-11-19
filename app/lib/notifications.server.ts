@@ -1,4 +1,4 @@
-import { and, count, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { alias } from "drizzle-orm/sqlite-core";
 import * as schema from "~/db/schema";
@@ -355,13 +355,23 @@ type NotificationRow = ReturnType<
 /** How many Notifications the drawer loads at a time. */
 export const NOTIFICATIONS_PAGE_SIZE = 20;
 
+/** The drawer's filters: every Notification, or only the unread ones. */
+export type NotificationFilter = "all" | "unread";
+
 /**
- * Which of the recipient's Notifications to list. Filters and cursors belong
- * here; a cursor must be the (raisedAt, id) pair the list is sorted by, since
- * `raisedAt` comes from the event and doesn't follow insertion order.
+ * Where a Notification sits in the list: the (raisedAt, id) pair it's sorted
+ * by. Not the id alone, since `raisedAt` comes from the event and doesn't
+ * follow insertion order.
  */
+export type NotificationPosition = Pick<NotificationForDisplay, "raisedAt" | "id">;
+
+/** Which of the recipient's Notifications to list. */
 export type NotificationListQuery = {
   limit?: number;
+  /** "all" unless given. */
+  filter?: NotificationFilter;
+  /** Only Notifications older than this one: "Load older" passes the oldest shown. */
+  before?: NotificationPosition;
   /**
    * Only Notifications raised after this one: the newest one shown, for the
    * polling check that adds arrivals to the top of an open drawer.
@@ -369,29 +379,65 @@ export type NotificationListQuery = {
   newerThan?: NotificationPosition;
 };
 
-/** Where a Notification sits in the list: the (raisedAt, id) pair it's sorted by. */
-export type NotificationPosition = Pick<NotificationForDisplay, "raisedAt" | "id">;
+/** One page of the drawer's list, and whether older Notifications exist past it. */
+export type NotificationPage = {
+  notifications: NotificationForDisplay[];
+  hasOlder: boolean;
+};
 
-/** The recipient's newest Notifications, newest first: one page of the drawer. */
+/** The recipient's Notifications, newest first: one page of the drawer. */
 export function listNotifications(
   db: Queryable,
   recipientId: number,
-  { limit = NOTIFICATIONS_PAGE_SIZE, newerThan }: NotificationListQuery = {}
+  query: NotificationListQuery = {}
 ): NotificationForDisplay[] {
-  return selectNotifications(db)
+  return listNotificationPage(db, recipientId, query).notifications;
+}
+
+/**
+ * A page of the recipient's Notifications, newest first, saying whether older
+ * ones exist past it so the drawer knows to offer "Load older".
+ */
+export function listNotificationPage(
+  db: Queryable,
+  recipientId: number,
+  {
+    limit = NOTIFICATIONS_PAGE_SIZE,
+    filter = "all",
+    before,
+    newerThan,
+  }: NotificationListQuery = {}
+): NotificationPage {
+  const rows = selectNotifications(db)
     .where(
       and(
         eq(notifications.recipientId, recipientId),
+        filter === "unread" ? isNull(notifications.readAt) : undefined,
+        before && sortsBelow(before),
         newerThan && sortsAbove(newerThan)
       )
     )
     .orderBy(desc(notifications.raisedAt), desc(notifications.id))
-    .limit(limit)
-    .all()
-    .flatMap((row) => {
+    // One more than the page, to tell whether older ones exist. Decided on the
+    // rows, since rendering may leave some out.
+    .limit(limit + 1)
+    .all();
+
+  return {
+    notifications: rows.slice(0, limit).flatMap((row) => {
       const rendered = render(row);
       return rendered ? [rendered] : [];
-    });
+    }),
+    hasOlder: rows.length > limit,
+  };
+}
+
+/** Raised earlier than the given position, or at the same time and stored earlier. */
+function sortsBelow({ raisedAt, id }: NotificationPosition) {
+  return or(
+    lt(notifications.raisedAt, raisedAt),
+    and(eq(notifications.raisedAt, raisedAt), lt(notifications.id, id))
+  );
 }
 
 /** Raised later than the given position, or at the same time and stored later. */
@@ -441,6 +487,49 @@ export function markRead(
     .run();
 
   return result.changes > 0;
+}
+
+/**
+ * Marks one of the recipient's Notifications unread again, to keep it as a
+ * reminder. Returns false when the recipient has no Notification with that id.
+ */
+export function markUnread(
+  db: Queryable,
+  recipientId: number,
+  notificationId: number
+): boolean {
+  const result = db
+    .update(notifications)
+    .set({ readAt: null })
+    .where(
+      and(
+        eq(notifications.id, notificationId),
+        eq(notifications.recipientId, recipientId)
+      )
+    )
+    .run();
+
+  return result.changes > 0;
+}
+
+/**
+ * Marks every unread Notification of the recipient read, whether or not the
+ * drawer has loaded it. Ones already read keep the time they were first read.
+ */
+export function markAllRead(
+  db: Queryable,
+  recipientId: number,
+  at: Date = new Date()
+): void {
+  db.update(notifications)
+    .set({ readAt: at.toISOString() })
+    .where(
+      and(
+        eq(notifications.recipientId, recipientId),
+        isNull(notifications.readAt)
+      )
+    )
+    .run();
 }
 
 // ─── Rendering ───

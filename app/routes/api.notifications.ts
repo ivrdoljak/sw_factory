@@ -5,8 +5,11 @@ import { db } from "~/db";
 import { requireUserId } from "~/lib/access.server";
 import {
   countUnread,
-  listNotifications,
+  listNotificationPage,
+  markAllRead,
   markRead,
+  markUnread,
+  type NotificationPosition,
 } from "~/lib/notifications.server";
 import { parseFormData } from "~/lib/validation";
 
@@ -21,6 +24,10 @@ import { parseFormData } from "~/lib/validation";
 
 const listSchema = z
   .object({
+    filter: z.enum(["all", "unread"]).default("all"),
+    // "Load older": the oldest Notification shown, as its (raisedAt, id) pair.
+    beforeRaisedAt: z.string().datetime().optional(),
+    beforeId: z.coerce.number().int().positive().optional(),
     // The polling check: just the unread count, for the badge.
     only: z.literal("unread-count").optional(),
     // The polling check with the drawer open: only Notifications raised after
@@ -30,10 +37,22 @@ const listSchema = z
   })
   .refine(
     (query) =>
+      (query.beforeRaisedAt === undefined) === (query.beforeId === undefined),
+    "beforeRaisedAt and beforeId go together"
+  )
+  .refine(
+    (query) =>
       (query.newerThanRaisedAt === undefined) ===
       (query.newerThanId === undefined),
     "newerThanRaisedAt and newerThanId go together"
   );
+
+function position(
+  raisedAt: string | undefined,
+  id: number | undefined
+): NotificationPosition | undefined {
+  return raisedAt !== undefined && id !== undefined ? { raisedAt, id } : undefined;
+}
 
 export async function loader({ request, url }: Route.LoaderArgs) {
   const userId = await requireUserId(request);
@@ -41,26 +60,26 @@ export async function loader({ request, url }: Route.LoaderArgs) {
   const parsed = listSchema.safeParse(Object.fromEntries(url.searchParams));
   if (!parsed.success) throw data("Invalid Notifications query", { status: 400 });
 
-  const { only, newerThanRaisedAt, newerThanId } = parsed.data;
+  const query = parsed.data;
   const unreadCount = countUnread(db, userId);
-  if (only === "unread-count") return { unreadCount };
+  if (query.only === "unread-count") return { unreadCount };
 
-  const newerThan =
-    newerThanRaisedAt !== undefined && newerThanId !== undefined
-      ? { raisedAt: newerThanRaisedAt, id: newerThanId }
-      : undefined;
+  const page = listNotificationPage(db, userId, {
+    filter: query.filter,
+    before: position(query.beforeRaisedAt, query.beforeId),
+    newerThan: position(query.newerThanRaisedAt, query.newerThanId),
+  });
 
-  return {
-    notifications: listNotifications(db, userId, { newerThan }),
-    unreadCount,
-  };
+  // The filter is echoed so the drawer can drop a page meant for another one.
+  return { ...page, filter: query.filter, unreadCount };
 }
 
+const notificationId = z.coerce.number().int().positive();
+
 const actionSchema = z.discriminatedUnion("intent", [
-  z.object({
-    intent: z.literal("mark-read"),
-    notificationId: z.coerce.number().int().positive(),
-  }),
+  z.object({ intent: z.literal("mark-read"), notificationId }),
+  z.object({ intent: z.literal("mark-unread"), notificationId }),
+  z.object({ intent: z.literal("mark-all-read") }),
 ]);
 
 export async function action({ request }: Route.ActionArgs) {
@@ -74,6 +93,16 @@ export async function action({ request }: Route.ActionArgs) {
       if (!markRead(db, userId, parsed.data.notificationId)) {
         throw data("Notification not found", { status: 404 });
       }
+      return { ok: true };
+    }
+    case "mark-unread": {
+      if (!markUnread(db, userId, parsed.data.notificationId)) {
+        throw data("Notification not found", { status: 404 });
+      }
+      return { ok: true };
+    }
+    case "mark-all-read": {
+      markAllRead(db, userId);
       return { ok: true };
     }
   }

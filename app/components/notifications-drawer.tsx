@@ -17,9 +17,15 @@ import {
   UserPlus,
 } from "lucide-react";
 import { NotificationEventKind, RefundStatus } from "~/db/schema";
-import type { NotificationForDisplay } from "~/lib/notifications.server";
+import type {
+  NotificationFilter,
+  NotificationForDisplay,
+  NotificationPage,
+  NotificationPosition,
+} from "~/lib/notifications.server";
 import type { loader as notificationsLoader } from "~/routes/api.notifications";
 import { cn, formatRelativeTime } from "~/lib/utils";
+import { Button } from "~/components/ui/button";
 import { Skeleton } from "~/components/ui/skeleton";
 import {
   Drawer,
@@ -36,6 +42,11 @@ import {
 
 const NOTIFICATIONS_ENDPOINT = "/api/notifications";
 
+const FILTERS: { value: NotificationFilter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "unread", label: "Unread" },
+];
+
 type NotificationsDrawerProps = {
   /** The count from the app layout loader, fresh on every page change. */
   unreadCount: number;
@@ -45,13 +56,16 @@ export function NotificationsDrawer({
   unreadCount: loaderUnreadCount,
 }: NotificationsDrawerProps) {
   const [open, setOpen] = useState(false);
-  const { notifications, addNewer, listRef } = useNotificationList(open);
+  const [filter, setFilter] = useState<NotificationFilter>("all");
+  const list = useNotificationList(open, filter);
   const unreadCount = useNotificationCheck({
     loaderUnreadCount,
-    shown: open ? notifications : null,
-    addNewer,
+    shown: open ? list.notifications : null,
+    filter,
+    addNewer: list.addNewer,
   });
   const markFetcher = useFetcher();
+  const markAllFetcher = useFetcher();
   const navigate = useNavigate();
 
   /**
@@ -75,12 +89,21 @@ export function NotificationsDrawer({
       setOpen(false);
     }
     if (!notification.read) {
+      list.setRead(notification.id, true);
       await markFetcher.submit(
         { intent: "mark-read", notificationId: notification.id },
         { method: "post", action: NOTIFICATIONS_ENDPOINT }
       );
     }
     if (!opensElsewhere) await navigate(notification.link);
+  }
+
+  function markAllRead() {
+    list.setAllRead();
+    void markAllFetcher.submit(
+      { intent: "mark-all-read" },
+      { method: "post", action: NOTIFICATIONS_ENDPOINT }
+    );
   }
 
   return (
@@ -102,28 +125,79 @@ export function NotificationsDrawer({
             Your newest Notifications. Opening one marks it read.
           </DrawerDescription>
         </DrawerHeader>
+        <div className="flex items-center gap-1 border-b px-5 py-2">
+          {FILTERS.map(({ value, label }) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={filter === value}
+              onClick={() => setFilter(value)}
+              className={cn(
+                "rounded-full px-3 py-1 text-xs font-medium transition-colors",
+                filter === value
+                  ? "bg-foreground text-background"
+                  : "hover:bg-accent"
+              )}
+            >
+              {value === "unread" ? `${label} (${unreadCount})` : label}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={markAllRead}
+            disabled={unreadCount === 0 || markAllFetcher.state !== "idle"}
+            className="ml-auto flex items-center gap-1 text-xs text-primary hover:underline disabled:text-muted-foreground disabled:no-underline"
+          >
+            <CheckCheck className="size-3.5" />
+            Mark all as read
+          </button>
+        </div>
         {/* Scroll anchoring is done by hand in `useNotificationList`, the same
             in every browser, so the browser's own is off. */}
-        <div ref={listRef} className="flex-1 overflow-y-auto [overflow-anchor:none]">
-          {notifications === null ? (
+        <div
+          ref={list.listRef}
+          className="flex-1 overflow-y-auto [overflow-anchor:none]"
+        >
+          {list.notifications === null ? (
             <NotificationListSkeleton />
-          ) : notifications.length === 0 ? (
-            <EmptyState>Nothing here yet.</EmptyState>
+          ) : list.notifications.length === 0 ? (
+            <EmptyState>
+              {filter === "unread"
+                ? "No unread Notifications."
+                : "Nothing here yet."}
+            </EmptyState>
           ) : (
-            groupByAge(notifications, Date.now()).map((group) => (
-              <section key={group.label}>
-                <h3 className="bg-muted/50 px-5 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  {group.label}
-                </h3>
-                {group.notifications.map((notification) => (
-                  <NotificationRow
-                    key={notification.id}
-                    notification={notification}
-                    onOpen={(event) => void openNotification(event, notification)}
-                  />
-                ))}
-              </section>
-            ))
+            <>
+              {groupByAge(list.notifications, Date.now()).map((group) => (
+                <section key={group.label}>
+                  <h3 className="bg-muted/50 px-5 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    {group.label}
+                  </h3>
+                  {group.notifications.map((notification) => (
+                    <NotificationRow
+                      key={notification.id}
+                      notification={notification}
+                      onOpen={(event) =>
+                        void openNotification(event, notification)
+                      }
+                      onMarked={(read) => list.setRead(notification.id, read)}
+                    />
+                  ))}
+                </section>
+              ))}
+              {list.hasOlder && (
+                <div className="flex justify-center px-5 py-4">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={list.loadOlder}
+                    disabled={list.loadingOlder}
+                  >
+                    {list.loadingOlder ? "Loading…" : "Load older"}
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </div>
       </DrawerContent>
@@ -131,36 +205,82 @@ export function NotificationsDrawer({
   );
 }
 
+type NotificationListState = Omit<NotificationPage, "notifications"> & {
+  /** Null while the newest page for the filter is loading. */
+  notifications: NotificationForDisplay[] | null;
+};
+
+const LOADING: NotificationListState = { notifications: null, hasOlder: false };
+
+type ListResponse = Awaited<ReturnType<typeof notificationsLoader>>;
+
+/** The page in a response, or null if it has none or was loaded for another filter. */
+function pageFor(
+  response: ListResponse | undefined,
+  filter: NotificationFilter
+): NotificationPage | null {
+  if (!response || !("notifications" in response)) return null;
+  return response.filter === filter ? response : null;
+}
+
 /**
- * The drawer's list: null until the newest page has loaded. Every opening
- * loads it afresh, and opening marks nothing read.
+ * The drawer's list for the current filter. Every opening, and every switch of
+ * filter, loads the newest page afresh; opening marks nothing read. "Load
+ * older" appends the next page, by the position of the oldest one shown, so
+ * arrivals added to the top don't disturb it.
+ *
+ * After any mark, React Router reloads each fetcher's last page. Pages are
+ * therefore merged by id, never replacing what's shown, and marks change the
+ * list here straight away rather than waiting for those reloads.
  */
-function useNotificationList(open: boolean) {
-  const fetcher = useFetcher<typeof notificationsLoader>();
-  const { load } = fetcher;
-  const [notifications, setNotifications] = useState<
-    NotificationForDisplay[] | null
-  >(null);
+function useNotificationList(open: boolean, filter: NotificationFilter) {
+  const newestFetcher = useFetcher<typeof notificationsLoader>();
+  const olderFetcher = useFetcher<typeof notificationsLoader>();
+  const [state, setState] = useState<NotificationListState>(LOADING);
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
   const listRef = useRef<HTMLDivElement>(null);
   const scrollBeforeArrivals = useRef<{
     scrollTop: number;
     scrollHeight: number;
   } | null>(null);
+  // Whether "Load older" was used on the list shown. The older fetcher keeps
+  // its last URL after the list resets, and reloads it after any mark; that
+  // page belongs to the old list and would leave a gap in the new one.
+  const olderPagesShown = useRef(false);
 
+  const { load: loadNewest } = newestFetcher;
   useEffect(() => {
     if (!open) return;
-    setNotifications(null);
-    void load(NOTIFICATIONS_ENDPOINT);
-  }, [open, load]);
+    olderPagesShown.current = false;
+    setState(LOADING);
+    void loadNewest(listUrl(filter));
+  }, [open, filter, loadNewest]);
 
-  // The newest page replaces the list. Older pages will merge in here rather
-  // than replace it.
+  // Each page is handled once, when it arrives. One loaded for another filter
+  // is dropped, and an older page only extends the list it was loaded for.
   useEffect(() => {
-    if (fetcher.data?.notifications) {
-      scrollBeforeArrivals.current = null;
-      setNotifications(fetcher.data.notifications);
-    }
-  }, [fetcher.data]);
+    const page = pageFor(newestFetcher.data, filterRef.current);
+    if (!page) return;
+    scrollBeforeArrivals.current = null;
+    setState((list) =>
+      list.notifications === null ? page : mergePage(shown(list), page)
+    );
+  }, [newestFetcher.data]);
+  useEffect(() => {
+    const page = pageFor(olderFetcher.data, filterRef.current);
+    if (!page || !olderPagesShown.current) return;
+    setState((list) =>
+      list.notifications === null ? list : mergePage(shown(list), page)
+    );
+  }, [olderFetcher.data]);
+
+  function loadOlder() {
+    const oldest = state.notifications?.at(-1);
+    if (!oldest) return;
+    olderPagesShown.current = true;
+    void olderFetcher.load(listUrl(filter, oldest));
+  }
 
   /**
    * Adds Notifications newer than the newest shown to the top of the list.
@@ -168,15 +288,23 @@ function useNotificationList(open: boolean) {
    * arrivals. A full page of them may not meet the rows shown, so it
    * replaces the list rather than leave a gap.
    */
-  function addNewer(newer: NotificationForDisplay[]) {
-    if (notifications === null) return;
-    const shown = new Set(notifications.map((notification) => notification.id));
-    const arrivals = newer.filter((notification) => !shown.has(notification.id));
+  function addNewer(response: ListResponse) {
+    const page = pageFor(response, filterRef.current);
+    const notifications = state.notifications;
+    if (!page || notifications === null) return;
+    const shownIds = new Set(notifications.map((notification) => notification.id));
+    const arrivals = page.notifications.filter(
+      (notification) => !shownIds.has(notification.id)
+    );
     if (arrivals.length === 0) return;
 
-    if (newer.length >= PAGE_SIZE) {
+    if (page.notifications.length >= PAGE_SIZE) {
       scrollBeforeArrivals.current = null;
-      setNotifications(newer);
+      setState({
+        notifications: page.notifications,
+        // What was shown is older than all of them.
+        hasOlder: page.hasOlder || notifications.length > 0,
+      });
       return;
     }
 
@@ -185,7 +313,11 @@ function useNotificationList(open: boolean) {
       list && list.scrollTop > 0
         ? { scrollTop: list.scrollTop, scrollHeight: list.scrollHeight }
         : null;
-    setNotifications([...arrivals, ...notifications]);
+    setState((current) =>
+      current.notifications === null
+        ? current
+        : mergePage(shown(current), { notifications: arrivals, hasOlder: page.hasOlder })
+    );
   }
 
   // Shifts the scroll by the height the arrivals added, so the rows the person
@@ -196,9 +328,80 @@ function useNotificationList(open: boolean) {
     scrollBeforeArrivals.current = null;
     if (!before || !list) return;
     list.scrollTop = before.scrollTop + (list.scrollHeight - before.scrollHeight);
-  }, [notifications]);
+  }, [state.notifications]);
 
-  return { notifications, addNewer, listRef };
+  function setRead(id: number, read: boolean) {
+    setState((list) => ({
+      ...list,
+      notifications:
+        list.notifications?.map((n) => (n.id === id ? { ...n, read } : n)) ??
+        null,
+    }));
+  }
+
+  /** Under Unread nothing is left to show; under All everything turns read. */
+  function setAllRead() {
+    setState((list) =>
+      filterRef.current === "unread"
+        ? { notifications: [], hasOlder: false }
+        : {
+            ...list,
+            notifications:
+              list.notifications?.map((n) => ({ ...n, read: true })) ?? null,
+          }
+    );
+  }
+
+  return {
+    notifications: state.notifications,
+    hasOlder: state.hasOlder,
+    loadingOlder: olderFetcher.state === "loading",
+    loadOlder,
+    addNewer,
+    setRead,
+    setAllRead,
+    listRef,
+  };
+}
+
+function shown({ notifications, hasOlder }: NotificationListState): NotificationPage {
+  return { notifications: notifications ?? [], hasOlder };
+}
+
+/** A page of the list for the filter: the newest, or the one before a position. */
+function listUrl(filter: NotificationFilter, before?: NotificationPosition) {
+  const params = new URLSearchParams({ filter });
+  if (before) {
+    params.set("beforeRaisedAt", before.raisedAt);
+    params.set("beforeId", String(before.id));
+  }
+  return `${NOTIFICATIONS_ENDPOINT}?${params}`;
+}
+
+/** Newest first, by the (raisedAt, id) pair the server sorts by. */
+function newestFirst(a: NotificationPosition, b: NotificationPosition): number {
+  if (a.raisedAt !== b.raisedAt) return a.raisedAt < b.raisedAt ? 1 : -1;
+  return b.id - a.id;
+}
+
+/**
+ * Adds a page to the list shown, updating the Notifications it already has.
+ * Nothing shown is removed. Whether older ones exist is taken from the page
+ * only when it reaches the bottom of the list.
+ */
+function mergePage(list: NotificationPage, page: NotificationPage): NotificationPage {
+  const byId = new Map(list.notifications.map((n) => [n.id, n]));
+  for (const notification of page.notifications) {
+    byId.set(notification.id, notification);
+  }
+  const notifications = [...byId.values()].sort(newestFirst);
+  const oldest = notifications.at(-1);
+  const reachesBottom =
+    oldest !== undefined && page.notifications.some((n) => n.id === oldest.id);
+  return {
+    notifications,
+    hasOlder: reachesBottom ? page.hasOlder : list.hasOlder,
+  };
 }
 
 /** Matches `NOTIFICATIONS_PAGE_SIZE`, the most one request returns. */
@@ -210,8 +413,8 @@ const CHECK_INTERVAL_MS = 30_000;
 /**
  * Checks about every 30 seconds, while the tab is visible, for new
  * Notifications, and returns the unread count for the badge. With the drawer
- * open, the same check fetches the Notifications newer than the newest shown
- * and adds them to the top.
+ * open, the same check fetches the Notifications newer than the newest shown,
+ * under the current filter, and adds them to the top.
  *
  * Arrivals change only the badge: no toast, sound or tab title. The check
  * loads the notifications endpoint with a fetcher, so the heavy app layout
@@ -220,12 +423,14 @@ const CHECK_INTERVAL_MS = 30_000;
 function useNotificationCheck({
   loaderUnreadCount,
   shown,
+  filter,
   addNewer,
 }: {
   loaderUnreadCount: number;
   /** The drawer's list while it's open and loaded, otherwise null. */
   shown: NotificationForDisplay[] | null;
-  addNewer: (newer: NotificationForDisplay[]) => void;
+  filter: NotificationFilter;
+  addNewer: (response: ListResponse) => void;
 }): number {
   const fetcher = useFetcher<typeof notificationsLoader>();
   const { load } = fetcher;
@@ -243,30 +448,35 @@ function useNotificationCheck({
   useEffect(() => {
     if (!fetcher.data) return;
     setUnreadCount(fetcher.data.unreadCount);
-    if (fetcher.data.notifications) addNewerRef.current(fetcher.data.notifications);
+    addNewerRef.current(fetcher.data);
   }, [fetcher.data]);
 
   useVisibleTabInterval(
-    () => void load(notificationCheckUrl(shown)),
+    () => void load(notificationCheckUrl(shown, filter)),
     CHECK_INTERVAL_MS
   );
 
   return unreadCount;
 }
 
-/** The count alone, or with the drawer open, the Notifications newer than the newest shown. */
-function notificationCheckUrl(shown: NotificationForDisplay[] | null): string {
-  const params = new URLSearchParams();
-  const newest = shown?.[0];
-  if (shown === null) {
-    params.set("only", "unread-count");
-  } else if (newest) {
+/**
+ * The count alone, or with the drawer open, the Notifications under its filter
+ * newer than the newest shown.
+ */
+function notificationCheckUrl(
+  shown: NotificationForDisplay[] | null,
+  filter: NotificationFilter
+): string {
+  if (shown === null) return `${NOTIFICATIONS_ENDPOINT}?only=unread-count`;
+
+  const params = new URLSearchParams({ filter });
+  const newest = shown[0];
+  // An open drawer with nothing in it yet checks the newest page.
+  if (newest) {
     params.set("newerThanRaisedAt", newest.raisedAt);
     params.set("newerThanId", String(newest.id));
   }
-  // An open drawer with nothing in it yet checks the newest page.
-  const query = params.toString();
-  return query ? `${NOTIFICATIONS_ENDPOINT}?${query}` : NOTIFICATIONS_ENDPOINT;
+  return `${NOTIFICATIONS_ENDPOINT}?${params}`;
 }
 
 /**
@@ -388,11 +598,29 @@ const REFUND_STATUS_TAGS: Record<
 function NotificationRow({
   notification,
   onOpen,
+  onMarked,
 }: {
   notification: NotificationForDisplay;
   onOpen: (event: MouseEvent<HTMLAnchorElement>) => void;
+  /** Called as soon as the row is marked read or unread from its hover link. */
+  onMarked: (read: boolean) => void;
 }) {
+  // Each row marks through its own fetcher, so quick marks on several rows
+  // don't cancel one another.
+  const markFetcher = useFetcher();
   const unread = !notification.read;
+
+  /** Toggles read and unread without opening the Notification. */
+  function toggleRead() {
+    onMarked(unread);
+    void markFetcher.submit(
+      {
+        intent: unread ? "mark-read" : "mark-unread",
+        notificationId: notification.id,
+      },
+      { method: "post", action: NOTIFICATIONS_ENDPOINT }
+    );
+  }
   const statusTag = notification.refundStatus
     ? REFUND_STATUS_TAGS[notification.refundStatus]
     : null;
@@ -439,6 +667,13 @@ function NotificationRow({
           <time dateTime={notification.raisedAt} suppressHydrationWarning>
             {formatRelativeTime(notification.raisedAt)}
           </time>
+          <button
+            type="button"
+            onClick={toggleRead}
+            className="relative z-10 opacity-0 transition-opacity hover:text-foreground hover:underline focus-visible:opacity-100 group-hover:opacity-100"
+          >
+            {unread ? "Mark as read" : "Mark as unread"}
+          </button>
         </div>
       </div>
     </article>
