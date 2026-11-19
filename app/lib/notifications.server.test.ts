@@ -182,6 +182,69 @@ describe("the drawer's list", () => {
   });
 });
 
+describe("checking for newer Notifications", () => {
+  function raiseDeclined(raisedAt: Date) {
+    const refundRequestId = declinedRefundRequest(base.user.id);
+    db.transaction((tx) => {
+      notify(tx, declined(refundRequestId, platformAdmin.id, raisedAt));
+    });
+  }
+
+  it("returns only Notifications raised after the newest one shown, newest first", () => {
+    raiseDeclined(hoursBefore(5));
+    raiseDeclined(hoursBefore(3));
+    const [newestShown] = listNotifications(db, base.user.id);
+
+    raiseDeclined(hoursBefore(2));
+    raiseDeclined(hoursBefore(1));
+
+    const newer = listNotifications(db, base.user.id, {
+      newerThan: newestShown,
+    });
+
+    expect(newer.map((n) => n.raisedAt)).toEqual([
+      hoursBefore(1).toISOString(),
+      hoursBefore(2).toISOString(),
+    ]);
+  });
+
+  it("includes one raised at the same moment as the newest shown but stored after it", () => {
+    raiseDeclined(NOW);
+    const [newestShown] = listNotifications(db, base.user.id);
+
+    raiseDeclined(NOW);
+
+    const newer = listNotifications(db, base.user.id, {
+      newerThan: newestShown,
+    });
+
+    expect(newer).toHaveLength(1);
+    expect(newer[0].id).not.toBe(newestShown.id);
+    expect(newer[0].raisedAt).toBe(NOW.toISOString());
+  });
+
+  it("leaves out one stored later but raised before the newest shown", () => {
+    raiseDeclined(hoursBefore(1));
+    const [newestShown] = listNotifications(db, base.user.id);
+
+    raiseDeclined(hoursBefore(2));
+
+    expect(
+      listNotifications(db, base.user.id, { newerThan: newestShown })
+    ).toEqual([]);
+    expect(listNotifications(db, base.user.id)).toHaveLength(2);
+  });
+
+  it("returns nothing when no Notification is newer than the newest shown", () => {
+    raiseDeclined(hoursBefore(1));
+    const [newestShown] = listNotifications(db, base.user.id);
+
+    expect(
+      listNotifications(db, base.user.id, { newerThan: newestShown })
+    ).toEqual([]);
+  });
+});
+
 describe("a new question", () => {
   let lessonId: number;
 

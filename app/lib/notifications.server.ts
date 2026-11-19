@@ -1,4 +1,4 @@
-import { and, count, desc, eq, isNull, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { alias } from "drizzle-orm/sqlite-core";
 import * as schema from "~/db/schema";
@@ -362,16 +362,29 @@ export const NOTIFICATIONS_PAGE_SIZE = 20;
  */
 export type NotificationListQuery = {
   limit?: number;
+  /**
+   * Only Notifications raised after this one: the newest one shown, for the
+   * polling check that adds arrivals to the top of an open drawer.
+   */
+  newerThan?: NotificationPosition;
 };
+
+/** Where a Notification sits in the list: the (raisedAt, id) pair it's sorted by. */
+export type NotificationPosition = Pick<NotificationForDisplay, "raisedAt" | "id">;
 
 /** The recipient's newest Notifications, newest first: one page of the drawer. */
 export function listNotifications(
   db: Queryable,
   recipientId: number,
-  { limit = NOTIFICATIONS_PAGE_SIZE }: NotificationListQuery = {}
+  { limit = NOTIFICATIONS_PAGE_SIZE, newerThan }: NotificationListQuery = {}
 ): NotificationForDisplay[] {
   return selectNotifications(db)
-    .where(eq(notifications.recipientId, recipientId))
+    .where(
+      and(
+        eq(notifications.recipientId, recipientId),
+        newerThan && sortsAbove(newerThan)
+      )
+    )
     .orderBy(desc(notifications.raisedAt), desc(notifications.id))
     .limit(limit)
     .all()
@@ -379,6 +392,14 @@ export function listNotifications(
       const rendered = render(row);
       return rendered ? [rendered] : [];
     });
+}
+
+/** Raised later than the given position, or at the same time and stored later. */
+function sortsAbove({ raisedAt, id }: NotificationPosition) {
+  return or(
+    gt(notifications.raisedAt, raisedAt),
+    and(eq(notifications.raisedAt, raisedAt), gt(notifications.id, id))
+  );
 }
 
 /** How many of the recipient's Notifications are unread. */

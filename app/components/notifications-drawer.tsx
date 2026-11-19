@@ -1,4 +1,11 @@
-import { useEffect, useState, type MouseEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 import { Link, useFetcher, useNavigate } from "react-router";
 import {
   Bell,
@@ -29,11 +36,21 @@ import {
 
 const NOTIFICATIONS_ENDPOINT = "/api/notifications";
 
-type NotificationsDrawerProps = { unreadCount: number };
+type NotificationsDrawerProps = {
+  /** The count from the app layout loader, fresh on every page change. */
+  unreadCount: number;
+};
 
-export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
+export function NotificationsDrawer({
+  unreadCount: loaderUnreadCount,
+}: NotificationsDrawerProps) {
   const [open, setOpen] = useState(false);
-  const notifications = useNotificationList(open);
+  const { notifications, addNewer, listRef } = useNotificationList(open);
+  const unreadCount = useNotificationCheck({
+    loaderUnreadCount,
+    shown: open ? notifications : null,
+    addNewer,
+  });
   const markFetcher = useFetcher();
   const navigate = useNavigate();
 
@@ -85,7 +102,9 @@ export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
             Your newest Notifications. Opening one marks it read.
           </DrawerDescription>
         </DrawerHeader>
-        <div className="flex-1 overflow-y-auto">
+        {/* Scroll anchoring is done by hand in `useNotificationList`, the same
+            in every browser, so the browser's own is off. */}
+        <div ref={listRef} className="flex-1 overflow-y-auto [overflow-anchor:none]">
           {notifications === null ? (
             <NotificationListSkeleton />
           ) : notifications.length === 0 ? (
@@ -116,12 +135,17 @@ export function NotificationsDrawer({ unreadCount }: NotificationsDrawerProps) {
  * The drawer's list: null until the newest page has loaded. Every opening
  * loads it afresh, and opening marks nothing read.
  */
-function useNotificationList(open: boolean): NotificationForDisplay[] | null {
+function useNotificationList(open: boolean) {
   const fetcher = useFetcher<typeof notificationsLoader>();
   const { load } = fetcher;
   const [notifications, setNotifications] = useState<
     NotificationForDisplay[] | null
   >(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const scrollBeforeArrivals = useRef<{
+    scrollTop: number;
+    scrollHeight: number;
+  } | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -129,13 +153,157 @@ function useNotificationList(open: boolean): NotificationForDisplay[] | null {
     void load(NOTIFICATIONS_ENDPOINT);
   }, [open, load]);
 
-  // The newest page replaces the list. Older pages and newer arrivals will
-  // merge in here rather than replace it.
+  // The newest page replaces the list. Older pages will merge in here rather
+  // than replace it.
   useEffect(() => {
-    if (fetcher.data) setNotifications(fetcher.data.notifications);
+    if (fetcher.data?.notifications) {
+      scrollBeforeArrivals.current = null;
+      setNotifications(fetcher.data.notifications);
+    }
   }, [fetcher.data]);
 
-  return notifications;
+  /**
+   * Adds Notifications newer than the newest shown to the top of the list.
+   * Someone scrolled down keeps their place; at the very top they see the
+   * arrivals. A full page of them may not meet the rows shown, so it
+   * replaces the list rather than leave a gap.
+   */
+  function addNewer(newer: NotificationForDisplay[]) {
+    if (notifications === null) return;
+    const shown = new Set(notifications.map((notification) => notification.id));
+    const arrivals = newer.filter((notification) => !shown.has(notification.id));
+    if (arrivals.length === 0) return;
+
+    if (newer.length >= PAGE_SIZE) {
+      scrollBeforeArrivals.current = null;
+      setNotifications(newer);
+      return;
+    }
+
+    const list = listRef.current;
+    scrollBeforeArrivals.current =
+      list && list.scrollTop > 0
+        ? { scrollTop: list.scrollTop, scrollHeight: list.scrollHeight }
+        : null;
+    setNotifications([...arrivals, ...notifications]);
+  }
+
+  // Shifts the scroll by the height the arrivals added, so the rows the person
+  // is looking at stay where they are.
+  useLayoutEffect(() => {
+    const before = scrollBeforeArrivals.current;
+    const list = listRef.current;
+    scrollBeforeArrivals.current = null;
+    if (!before || !list) return;
+    list.scrollTop = before.scrollTop + (list.scrollHeight - before.scrollHeight);
+  }, [notifications]);
+
+  return { notifications, addNewer, listRef };
+}
+
+/** Matches `NOTIFICATIONS_PAGE_SIZE`, the most one request returns. */
+const PAGE_SIZE = 20;
+
+/** How often to check for new Notifications while the tab is visible. */
+const CHECK_INTERVAL_MS = 30_000;
+
+/**
+ * Checks about every 30 seconds, while the tab is visible, for new
+ * Notifications, and returns the unread count for the badge. With the drawer
+ * open, the same check fetches the Notifications newer than the newest shown
+ * and adds them to the top.
+ *
+ * Arrivals change only the badge: no toast, sound or tab title. The check
+ * loads the notifications endpoint with a fetcher, so the heavy app layout
+ * loader doesn't rerun.
+ */
+function useNotificationCheck({
+  loaderUnreadCount,
+  shown,
+  addNewer,
+}: {
+  loaderUnreadCount: number;
+  /** The drawer's list while it's open and loaded, otherwise null. */
+  shown: NotificationForDisplay[] | null;
+  addNewer: (newer: NotificationForDisplay[]) => void;
+}): number {
+  const fetcher = useFetcher<typeof notificationsLoader>();
+  const { load } = fetcher;
+  const [unreadCount, setUnreadCount] = useState(loaderUnreadCount);
+
+  // Whichever answered last wins: the layout loader on a page change or after
+  // a mark, or this check.
+  useEffect(() => setUnreadCount(loaderUnreadCount), [loaderUnreadCount]);
+
+  const addNewerRef = useRef(addNewer);
+  useEffect(() => {
+    addNewerRef.current = addNewer;
+  });
+
+  useEffect(() => {
+    if (!fetcher.data) return;
+    setUnreadCount(fetcher.data.unreadCount);
+    if (fetcher.data.notifications) addNewerRef.current(fetcher.data.notifications);
+  }, [fetcher.data]);
+
+  useVisibleTabInterval(
+    () => void load(notificationCheckUrl(shown)),
+    CHECK_INTERVAL_MS
+  );
+
+  return unreadCount;
+}
+
+/** The count alone, or with the drawer open, the Notifications newer than the newest shown. */
+function notificationCheckUrl(shown: NotificationForDisplay[] | null): string {
+  const params = new URLSearchParams();
+  const newest = shown?.[0];
+  if (shown === null) {
+    params.set("only", "unread-count");
+  } else if (newest) {
+    params.set("newerThanRaisedAt", newest.raisedAt);
+    params.set("newerThanId", String(newest.id));
+  }
+  // An open drawer with nothing in it yet checks the newest page.
+  const query = params.toString();
+  return query ? `${NOTIFICATIONS_ENDPOINT}?${query}` : NOTIFICATIONS_ENDPOINT;
+}
+
+/**
+ * Calls `callback` every `intervalMs` while the tab is visible (Page
+ * Visibility API). Hidden, it stops; visible again, it calls at once and
+ * starts over.
+ */
+function useVisibleTabInterval(callback: () => void, intervalMs: number) {
+  const callbackRef = useRef(callback);
+  useEffect(() => {
+    callbackRef.current = callback;
+  });
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | undefined;
+
+    function start() {
+      clearInterval(timer);
+      timer = setInterval(() => callbackRef.current(), intervalMs);
+    }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        callbackRef.current();
+        start();
+      } else {
+        clearInterval(timer);
+      }
+    }
+
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [intervalMs]);
 }
 
 /** The unread badge: hidden at zero, "9+" above nine. */
