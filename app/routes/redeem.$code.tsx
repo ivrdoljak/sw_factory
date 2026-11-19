@@ -13,6 +13,7 @@ import { Button } from "~/components/ui/button";
 import { Ticket, AlertCircle, CheckCircle2, Globe } from "lucide-react";
 import { data } from "react-router";
 import { db } from "~/db";
+import type { Queryable } from "~/db/types";
 import {
   purchases,
   coupons,
@@ -26,11 +27,11 @@ function getCourseById(id: number) {
   return db.select().from(courses).where(eq(courses.id, id)).get();
 }
 
-function getCouponByCode(code: string) {
+function getCouponByCode(db: Queryable, code: string) {
   return db.select().from(coupons).where(eq(coupons.code, code)).get();
 }
 
-function isUserEnrolled(userId: number, courseId: number) {
+function isUserEnrolled(db: Queryable, userId: number, courseId: number) {
   const existing = db
     .select()
     .from(enrollments)
@@ -62,11 +63,7 @@ function redeemCoupon(
   userCountry: string
 ): RedeemResult {
   return db.transaction((tx): RedeemResult => {
-    const coupon = tx
-      .select()
-      .from(coupons)
-      .where(eq(coupons.code, code))
-      .get();
+    const coupon = getCouponByCode(tx, code);
     if (!coupon) {
       return { ok: false, error: "Coupon not found" };
     }
@@ -83,18 +80,7 @@ function redeemCoupon(
       return { ok: false, error: SEAT_REFUNDED };
     }
 
-    const existingEnrollment = tx
-      .select()
-      .from(enrollments)
-      .where(
-        and(
-          eq(enrollments.userId, userId),
-          eq(enrollments.courseId, coupon.courseId)
-        )
-      )
-      .get();
-
-    if (existingEnrollment) {
+    if (isUserEnrolled(tx, userId, coupon.courseId)) {
       return { ok: false, error: "You are already enrolled in this course" };
     }
 
@@ -158,7 +144,7 @@ export function meta({ loaderData }: Route.MetaArgs) {
 export async function loader({ params, request }: Route.LoaderArgs) {
   const { code } = parseParams(params, redeemParamsSchema);
 
-  const coupon = getCouponByCode(code);
+  const coupon = getCouponByCode(db, code);
   if (!coupon) {
     throw data("Coupon not found.", { status: 404 });
   }
@@ -176,7 +162,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   }
 
   const alreadyRedeemed = coupon.redeemedByUserId !== null;
-  const alreadyEnrolled = isUserEnrolled(currentUserId, coupon.courseId);
+  const alreadyEnrolled = isUserEnrolled(db, currentUserId, coupon.courseId);
   const availability = getSeatAvailability(db, coupon);
   const unavailableReason =
     availability === "on_hold"
