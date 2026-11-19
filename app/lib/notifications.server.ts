@@ -29,8 +29,8 @@ import { commentAnchorId } from "~/lib/comments";
 //   shown, from current data.
 //
 // Adding a Notification Event kind is additive: a member of the
-// `NotificationEvent` union, a branch in `findDelivery`, and a branch in
-// `render`.
+// `NotificationEvent` union and an entry in `KINDS`, which holds each kind's
+// recipient rule and renderer together.
 
 // ─── Notification Events ───
 
@@ -85,6 +85,9 @@ export type NotificationEvent =
   | NewQuestionEvent
   | NewReplyEvent;
 
+/** The Notification Event of one kind. */
+type EventOf<K extends NotificationEventKind> = NotificationEvent & { kind: K };
+
 // ─── Write side ───
 
 type References = Pick<
@@ -108,7 +111,7 @@ const NOBODY: Delivery = { recipientIds: [], references: {} };
  * never notified.
  */
 export function notify(tx: Tx, event: NotificationEvent): void {
-  const { recipientIds, references } = findDelivery(tx, event);
+  const { recipientIds, references } = deliveryOf(tx, event);
   const recipients = new Set(recipientIds);
   recipients.delete(event.actorId);
 
@@ -127,22 +130,13 @@ export function notify(tx: Tx, event: NotificationEvent): void {
     .run();
 }
 
-/** The recipient rule for each Notification Event kind. */
-function findDelivery(tx: Tx, event: NotificationEvent): Delivery {
-  switch (event.kind) {
-    case NotificationEventKind.RefundRequestApproved:
-      return refundDecisionDelivery(tx, event);
-    case NotificationEventKind.RefundRequestDeclined:
-      return refundDecisionDelivery(tx, event);
-    case NotificationEventKind.RefundRequestRaised:
-      return refundRequestRaisedDelivery(tx, event);
-    case NotificationEventKind.SeatClaimed:
-      return seatClaimedDelivery(tx, event);
-    case NotificationEventKind.NewQuestion:
-      return newQuestionDelivery(tx, event);
-    case NotificationEventKind.NewReply:
-      return newReplyDelivery(tx, event);
-  }
+/** Applies the recipient rule of the event's kind. */
+function deliveryOf<K extends NotificationEventKind>(
+  tx: Tx,
+  event: EventOf<K>
+): Delivery {
+  const kind: K = event.kind;
+  return KINDS[kind].deliver(tx, event);
 }
 
 /** A decided Refund Request goes to the buyer of its Purchase. */
@@ -235,10 +229,21 @@ function seatClaimedDelivery(tx: Tx, event: SeatClaimedEvent): Delivery {
   };
 }
 
-/** A question on a lesson goes to the course's Instructor. */
-function newQuestionDelivery(tx: Tx, event: NewQuestionEvent): Delivery {
+/**
+ * A comment with where it was posted: the question it replies to (null for a
+ * question), its course's Instructor, and what its Notifications refer to.
+ */
+function findComment(
+  tx: Tx,
+  commentId: number
+): {
+  questionId: number | null;
+  instructorId: number;
+  references: References;
+} | null {
   const found = tx
     .select({
+      questionId: comments.parentId,
       lessonId: lessons.id,
       courseId: courses.id,
       instructorId: courses.instructorId,
@@ -247,18 +252,30 @@ function newQuestionDelivery(tx: Tx, event: NewQuestionEvent): Delivery {
     .innerJoin(lessons, eq(comments.lessonId, lessons.id))
     .innerJoin(modules, eq(lessons.moduleId, modules.id))
     .innerJoin(courses, eq(modules.courseId, courses.id))
-    .where(eq(comments.id, event.commentId))
+    .where(eq(comments.id, commentId))
     .get();
 
+  if (!found) return null;
+
+  return {
+    questionId: found.questionId,
+    instructorId: found.instructorId,
+    references: {
+      courseId: found.courseId,
+      lessonId: found.lessonId,
+      commentId,
+    },
+  };
+}
+
+/** A question on a lesson goes to the course's Instructor. */
+function newQuestionDelivery(tx: Tx, event: NewQuestionEvent): Delivery {
+  const found = findComment(tx, event.commentId);
   if (!found) return NOBODY;
 
   return {
     recipientIds: [found.instructorId],
-    references: {
-      courseId: found.courseId,
-      lessonId: found.lessonId,
-      commentId: event.commentId,
-    },
+    references: found.references,
   };
 }
 
@@ -268,39 +285,21 @@ function newQuestionDelivery(tx: Tx, event: NewQuestionEvent): Delivery {
  * posted. `notify` drops the replier and anyone listed twice.
  */
 function newReplyDelivery(tx: Tx, event: NewReplyEvent): Delivery {
-  const found = tx
-    .select({
-      questionId: comments.parentId,
-      lessonId: lessons.id,
-      courseId: courses.id,
-    })
-    .from(comments)
-    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
-    .innerJoin(modules, eq(lessons.moduleId, modules.id))
-    .innerJoin(courses, eq(modules.courseId, courses.id))
-    .where(eq(comments.id, event.commentId))
-    .get();
+  const found = findComment(tx, event.commentId);
+  if (!found) return NOBODY;
 
-  if (!found || found.questionId === null) return NOBODY;
+  const { questionId } = found;
+  if (questionId === null) return NOBODY;
 
   const posters = tx
     .select({ authorId: comments.userId })
     .from(comments)
-    .where(
-      or(
-        eq(comments.id, found.questionId),
-        eq(comments.parentId, found.questionId)
-      )
-    )
+    .where(or(eq(comments.id, questionId), eq(comments.parentId, questionId)))
     .all();
 
   return {
     recipientIds: posters.map((poster) => poster.authorId),
-    references: {
-      courseId: found.courseId,
-      lessonId: found.lessonId,
-      commentId: event.commentId,
-    },
+    references: found.references,
   };
 }
 
@@ -534,36 +533,25 @@ type Rendered = Pick<
   "title" | "link" | "detail" | "refundStatus"
 >;
 
-/** The renderer for each Notification Event kind. */
-function render(row: NotificationRow): NotificationForDisplay | null {
-  const rendered = renderKind(row);
-  if (!rendered) return null;
+/** Builds a kind's title, link and detail from current data. */
+type Renderer = (row: NotificationRow) => Rendered;
 
+/**
+ * A stored Notification, rendered by its kind. One whose kind this code
+ * doesn't know (say, from a newer version) is left out.
+ */
+function render(row: NotificationRow): NotificationForDisplay | null {
   const { notification } = row;
+  const definition: { render: Renderer } | undefined = KINDS[notification.kind];
+  if (!definition) return null;
+
   return {
     id: notification.id,
     kind: notification.kind,
-    ...rendered,
+    ...definition.render(row),
     raisedAt: notification.raisedAt,
     read: notification.readAt !== null,
   };
-}
-
-function renderKind(row: NotificationRow): Rendered | null {
-  switch (row.notification.kind) {
-    case NotificationEventKind.RefundRequestApproved:
-      return renderRefundRequestApproved(row);
-    case NotificationEventKind.RefundRequestDeclined:
-      return renderRefundRequestDeclined(row);
-    case NotificationEventKind.RefundRequestRaised:
-      return renderRefundRequestRaised(row);
-    case NotificationEventKind.SeatClaimed:
-      return renderSeatClaimed(row);
-    case NotificationEventKind.NewQuestion:
-      return renderNewQuestion(row);
-    case NotificationEventKind.NewReply:
-      return renderNewReply(row);
-  }
 }
 
 function renderRefundRequestApproved(row: NotificationRow): Rendered {
@@ -661,3 +649,39 @@ function commentLink(row: NotificationRow): string {
     ? lessonPage
     : `${lessonPage}#${commentAnchorId(commentId)}`;
 }
+
+// ─── Notification Event kinds ───
+
+/** What a Notification Event kind needs: who it goes to, and how it reads. */
+type KindDefinition<K extends NotificationEventKind> = {
+  /** The recipient rule. */
+  deliver: (tx: Tx, event: EventOf<K>) => Delivery;
+  render: Renderer;
+};
+
+const KINDS: { [K in NotificationEventKind]: KindDefinition<K> } = {
+  [NotificationEventKind.RefundRequestApproved]: {
+    deliver: refundDecisionDelivery,
+    render: renderRefundRequestApproved,
+  },
+  [NotificationEventKind.RefundRequestDeclined]: {
+    deliver: refundDecisionDelivery,
+    render: renderRefundRequestDeclined,
+  },
+  [NotificationEventKind.RefundRequestRaised]: {
+    deliver: refundRequestRaisedDelivery,
+    render: renderRefundRequestRaised,
+  },
+  [NotificationEventKind.SeatClaimed]: {
+    deliver: seatClaimedDelivery,
+    render: renderSeatClaimed,
+  },
+  [NotificationEventKind.NewQuestion]: {
+    deliver: newQuestionDelivery,
+    render: renderNewQuestion,
+  },
+  [NotificationEventKind.NewReply]: {
+    deliver: newReplyDelivery,
+    render: renderNewReply,
+  },
+};
