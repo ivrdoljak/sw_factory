@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import { cn } from "~/lib/utils";
 import { UserRole } from "~/db/schema";
 import { UserAvatar } from "~/components/user-avatar";
+import { NotificationsDrawer } from "~/components/notifications-drawer";
 import {
   BookOpen,
   ChartColumn,
@@ -41,6 +42,7 @@ interface SidebarProps {
   currentUser: CurrentUser | null;
   recentCourses?: RecentCourse[];
   isTeamAdmin?: boolean;
+  unreadNotificationCount?: number;
 }
 
 interface NavItem {
@@ -117,6 +119,7 @@ export function Sidebar({
   currentUser,
   recentCourses = [],
   isTeamAdmin = false,
+  unreadNotificationCount = 0,
 }: SidebarProps) {
   const currentUserRole = currentUser?.role ?? null;
   const [isDark, setIsDark] = useState(false);
@@ -143,6 +146,13 @@ export function Sidebar({
       </div>
 
       <nav className="flex-1 space-y-1 p-3">
+        {currentUser && (
+          // Keyed by user, so switching user in DevUI starts the drawer afresh.
+          <NotificationsDrawer
+            key={currentUser.id}
+            unreadCount={unreadNotificationCount}
+          />
+        )}
         {navItems
           .filter((item) => isVisible(item, currentUserRole))
           .map((item) => (

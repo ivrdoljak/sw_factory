@@ -1,0 +1,908 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import { createTestDb, seedBaseData } from "~/test/setup";
+import * as schema from "~/db/schema";
+import { NotificationEventKind, RefundStatus, UserRole } from "~/db/schema";
+import { eq } from "drizzle-orm";
+import {
+  countUnread,
+  markAllRead,
+  listNotificationPage,
+  listNotifications,
+  markRead,
+  markUnread,
+  notify,
+} from "./notifications.server";
+
+type TestDb = ReturnType<typeof createTestDb>;
+
+const NOW = new Date(2026, 9, 6, 12, 0, 0);
+
+let db: TestDb;
+let base: ReturnType<typeof seedBaseData>;
+let platformAdmin: typeof schema.users.$inferSelect;
+
+beforeEach(() => {
+  db = createTestDb();
+  base = seedBaseData(db);
+  platformAdmin = db
+    .insert(schema.users)
+    .values({ name: "Pat Admin", email: "pat@example.com", role: UserRole.Admin })
+    .returning()
+    .get();
+});
+
+/** An Individual Purchase with a Refund Request a Platform Admin has declined. */
+function declinedRefundRequest(buyerId: number) {
+  const purchase = db
+    .insert(schema.purchases)
+    .values({ userId: buyerId, courseId: base.course.id, amountPaid: 7900 })
+    .returning()
+    .get();
+  return db
+    .insert(schema.refunds)
+    .values({
+      purchaseId: purchase.id,
+      status: RefundStatus.Declined,
+      reason: "Not for me.",
+      decisionNote: "Past half way.",
+    })
+    .returning()
+    .get().id;
+}
+
+function declined(refundRequestId: number, actorId: number, raisedAt = NOW) {
+  return {
+    kind: NotificationEventKind.RefundRequestDeclined,
+    actorId,
+    refundRequestId,
+    raisedAt,
+  } as const;
+}
+
+describe("notify", () => {
+  it("raises nothing when the change it belongs to rolls back", () => {
+    const refundRequestId = declinedRefundRequest(base.user.id);
+
+    expect(() =>
+      db.transaction((tx) => {
+        notify(tx, declined(refundRequestId, platformAdmin.id));
+        throw new Error("The decision failed.");
+      })
+    ).toThrow("The decision failed.");
+
+    expect(listNotifications(db, base.user.id)).toEqual([]);
+    expect(countUnread(db, base.user.id)).toBe(0);
+  });
+
+  it("never notifies the person who acted", () => {
+    const refundRequestId = declinedRefundRequest(platformAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, declined(refundRequestId, platformAdmin.id));
+    });
+
+    expect(listNotifications(db, platformAdmin.id)).toEqual([]);
+    expect(countUnread(db, platformAdmin.id)).toBe(0);
+  });
+});
+
+describe("a recipient's Notifications", () => {
+  it("are listed newest first", () => {
+    const older = declinedRefundRequest(base.user.id);
+    const newer = declinedRefundRequest(base.user.id);
+    const yesterday = new Date(NOW);
+    yesterday.setDate(yesterday.getDate() - 1);
+
+    db.transaction((tx) => {
+      notify(tx, declined(newer, platformAdmin.id, NOW));
+      notify(tx, declined(older, platformAdmin.id, yesterday));
+    });
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { raisedAt: NOW.toISOString() },
+      { raisedAt: yesterday.toISOString() },
+    ]);
+    expect(countUnread(db, base.user.id)).toBe(2);
+  });
+});
+
+describe("marking a Notification read", () => {
+  function twoDeclinedRefundRequests() {
+    const first = declinedRefundRequest(base.user.id);
+    const second = declinedRefundRequest(base.user.id);
+    db.transaction((tx) => {
+      notify(tx, declined(first, platformAdmin.id));
+      notify(tx, declined(second, platformAdmin.id));
+    });
+    const [newest, other] = listNotifications(db, base.user.id);
+    return { newest, other };
+  }
+
+  it("marks only that Notification read and drops the unread count by one", () => {
+    const { newest, other } = twoDeclinedRefundRequests();
+
+    expect(markRead(db, base.user.id, newest.id)).toBe(true);
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { id: newest.id, read: true },
+      { id: other.id, read: false },
+    ]);
+    expect(countUnread(db, base.user.id)).toBe(1);
+  });
+
+  it("leaves an already read Notification read", () => {
+    const { newest } = twoDeclinedRefundRequests();
+    markRead(db, base.user.id, newest.id);
+
+    expect(markRead(db, base.user.id, newest.id)).toBe(true);
+
+    expect(listNotifications(db, base.user.id)[0]).toMatchObject({
+      id: newest.id,
+      read: true,
+    });
+    expect(countUnread(db, base.user.id)).toBe(1);
+  });
+
+  it("can't mark someone else's Notification read", () => {
+    const { newest } = twoDeclinedRefundRequests();
+
+    expect(markRead(db, base.instructor.id, newest.id)).toBe(false);
+
+    expect(listNotifications(db, base.user.id)[0]).toMatchObject({
+      id: newest.id,
+      read: false,
+    });
+    expect(countUnread(db, base.user.id)).toBe(2);
+  });
+
+  it("can be undone by marking it unread, which puts it back in the count and the Unread filter", () => {
+    const { newest, other } = twoDeclinedRefundRequests();
+    markRead(db, base.user.id, newest.id);
+    markRead(db, base.user.id, other.id);
+
+    expect(markUnread(db, base.user.id, newest.id)).toBe(true);
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { id: newest.id, read: false },
+      { id: other.id, read: true },
+    ]);
+    expect(countUnread(db, base.user.id)).toBe(1);
+    expect(
+      listNotifications(db, base.user.id, { filter: "unread" }).map((n) => n.id)
+    ).toEqual([newest.id]);
+  });
+
+  it("can't be undone on someone else's Notification", () => {
+    const { newest } = twoDeclinedRefundRequests();
+    markRead(db, base.user.id, newest.id);
+
+    expect(markUnread(db, base.instructor.id, newest.id)).toBe(false);
+
+    expect(listNotifications(db, base.user.id)[0]).toMatchObject({
+      id: newest.id,
+      read: true,
+    });
+    expect(countUnread(db, base.user.id)).toBe(1);
+  });
+});
+
+function hoursBefore(hours: number) {
+  return new Date(NOW.getTime() - hours * 60 * 60 * 1000);
+}
+
+describe("the drawer's list", () => {
+  it("is the newest 20 Notifications, newest first", () => {
+    // Raised out of order, so the newest are not simply the last stored.
+    const hoursAgo = [
+      3, 24, 0, 25, 7, 12, 1, 30, 18, 5, 22, 9, 2, 27, 14, 6, 20, 4, 11, 29,
+      16, 8, 26, 10, 13,
+    ];
+    db.transaction((tx) => {
+      for (const hours of hoursAgo) {
+        const refundRequestId = declinedRefundRequest(base.user.id);
+        notify(tx, declined(refundRequestId, platformAdmin.id, hoursBefore(hours)));
+      }
+    });
+
+    const listed = listNotifications(db, base.user.id);
+
+    // The five oldest (25 to 30 hours ago) are left out.
+    const newestTwenty = [
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24,
+    ].map((hours) => hoursBefore(hours).toISOString());
+    expect(listed.map((n) => n.raisedAt)).toEqual(newestTwenty);
+    expect(countUnread(db, base.user.id)).toBe(25);
+  });
+});
+
+/** Declined Refund Requests for the Student, raised the given hours ago, in that order. */
+function declinedHoursAgo(hoursAgo: number[]) {
+  db.transaction((tx) => {
+    for (const hours of hoursAgo) {
+      const refundRequestId = declinedRefundRequest(base.user.id);
+      notify(tx, declined(refundRequestId, platformAdmin.id, hoursBefore(hours)));
+    }
+  });
+}
+
+function hoursAgoOf(listed: { raisedAt: string }[]) {
+  return listed.map(
+    (n) => (NOW.getTime() - Date.parse(n.raisedAt)) / (60 * 60 * 1000)
+  );
+}
+
+describe("the Unread filter", () => {
+  it("lists only unread Notifications, newest first", () => {
+    declinedHoursAgo([1, 2, 3, 4]);
+    const [, twoHoursAgo, , fourHoursAgo] = listNotifications(db, base.user.id);
+    markRead(db, base.user.id, twoHoursAgo.id);
+    markRead(db, base.user.id, fourHoursAgo.id);
+
+    const unread = listNotifications(db, base.user.id, { filter: "unread" });
+
+    expect(hoursAgoOf(unread)).toEqual([1, 3]);
+    expect(unread.every((n) => !n.read)).toBe(true);
+  });
+
+  it("lists nothing once everything is read", () => {
+    declinedHoursAgo([1]);
+    const [only] = listNotifications(db, base.user.id);
+    markRead(db, base.user.id, only.id);
+
+    expect(listNotifications(db, base.user.id, { filter: "unread" })).toEqual([]);
+  });
+});
+
+describe("marking all Notifications read", () => {
+  it("marks every unread Notification read, including ones not loaded yet", () => {
+    // 25 unread: the drawer's first page shows only the newest 20.
+    declinedHoursAgo(Array.from({ length: 25 }, (_, hours) => hours));
+    const loaded = listNotificationPage(db, base.user.id);
+    expect(loaded.hasOlder).toBe(true);
+
+    markAllRead(db, base.user.id);
+
+    expect(countUnread(db, base.user.id)).toBe(0);
+    expect(listNotifications(db, base.user.id, { filter: "unread" })).toEqual([]);
+    const older = listNotifications(db, base.user.id, {
+      before: loaded.notifications[19],
+    });
+    expect(older).toHaveLength(5);
+    expect(older.every((n) => n.read)).toBe(true);
+  });
+
+  it("leaves other people's Notifications unread", () => {
+    declinedHoursAgo([1, 2]);
+    const otherStudent = db
+      .insert(schema.users)
+      .values({ name: "Other Student", email: "other@example.com", role: UserRole.Student })
+      .returning()
+      .get();
+    db.transaction((tx) => {
+      const refundRequestId = declinedRefundRequest(otherStudent.id);
+      notify(tx, declined(refundRequestId, platformAdmin.id));
+    });
+
+    markAllRead(db, base.user.id);
+
+    expect(countUnread(db, otherStudent.id)).toBe(1);
+    expect(listNotifications(db, otherStudent.id)).toMatchObject([{ read: false }]);
+  });
+});
+
+describe("Load older", () => {
+  it("fetches the next 20 after the oldest one shown, and says when none are left", () => {
+    // 25 raised out of order, hours 0 to 24 ago.
+    declinedHoursAgo([
+      3, 24, 0, 21, 7, 12, 1, 23, 18, 5, 22, 9, 2, 19, 14, 6, 20, 4, 11, 15,
+      16, 8, 17, 10, 13,
+    ]);
+
+    const newest = listNotificationPage(db, base.user.id);
+    expect(hoursAgoOf(newest.notifications)).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    ]);
+    expect(newest.hasOlder).toBe(true);
+
+    const older = listNotificationPage(db, base.user.id, {
+      before: newest.notifications[19],
+    });
+    expect(hoursAgoOf(older.notifications)).toEqual([20, 21, 22, 23, 24]);
+    expect(older.hasOlder).toBe(false);
+  });
+
+  it("doesn't offer more when the newest page holds exactly 20", () => {
+    declinedHoursAgo(Array.from({ length: 20 }, (_, hours) => hours));
+
+    expect(listNotificationPage(db, base.user.id).hasOlder).toBe(false);
+  });
+
+  it("neither skips nor repeats Notifications raised at the same moment across pages", () => {
+    // 22 raised at the same moment: the page boundary falls among them.
+    declinedHoursAgo(Array.from({ length: 22 }, () => 5));
+
+    const newest = listNotificationPage(db, base.user.id);
+    const older = listNotificationPage(db, base.user.id, {
+      before: newest.notifications[19],
+    });
+
+    const ids = [...newest.notifications, ...older.notifications].map((n) => n.id);
+    expect(older.notifications).toHaveLength(2);
+    expect(new Set(ids).size).toBe(22);
+    expect(older.hasOlder).toBe(false);
+  });
+
+  it("pages through only unread Notifications under the Unread filter", () => {
+    // 30 unread, hours 0 to 29 ago.
+    declinedHoursAgo(Array.from({ length: 30 }, (_, hours) => hours));
+    const all = listNotifications(db, base.user.id, { limit: 30 });
+    // Read before the first page: hours 2 and 25.
+    markRead(db, base.user.id, all[2].id);
+    markRead(db, base.user.id, all[25].id);
+
+    const newest = listNotificationPage(db, base.user.id, { filter: "unread" });
+    expect(hoursAgoOf(newest.notifications)).toEqual([
+      0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    ]);
+
+    // Read while the first page is shown: hour 27, not loaded yet.
+    markRead(db, base.user.id, all[27].id);
+
+    const older = listNotificationPage(db, base.user.id, {
+      filter: "unread",
+      before: newest.notifications[19],
+    });
+    expect(hoursAgoOf(older.notifications)).toEqual([21, 22, 23, 24, 26, 28, 29]);
+    expect(older.hasOlder).toBe(false);
+  });
+});
+
+describe("checking for newer Notifications", () => {
+  function raiseDeclined(raisedAt: Date) {
+    const refundRequestId = declinedRefundRequest(base.user.id);
+    db.transaction((tx) => {
+      notify(tx, declined(refundRequestId, platformAdmin.id, raisedAt));
+    });
+  }
+
+  it("returns only Notifications raised after the newest one shown, newest first", () => {
+    raiseDeclined(hoursBefore(5));
+    raiseDeclined(hoursBefore(3));
+    const [newestShown] = listNotifications(db, base.user.id);
+
+    raiseDeclined(hoursBefore(2));
+    raiseDeclined(hoursBefore(1));
+
+    const newer = listNotifications(db, base.user.id, {
+      newerThan: newestShown,
+    });
+
+    expect(newer.map((n) => n.raisedAt)).toEqual([
+      hoursBefore(1).toISOString(),
+      hoursBefore(2).toISOString(),
+    ]);
+  });
+
+  it("includes one raised at the same moment as the newest shown but stored after it", () => {
+    raiseDeclined(NOW);
+    const [newestShown] = listNotifications(db, base.user.id);
+
+    raiseDeclined(NOW);
+
+    const newer = listNotifications(db, base.user.id, {
+      newerThan: newestShown,
+    });
+
+    expect(newer).toHaveLength(1);
+    expect(newer[0].id).not.toBe(newestShown.id);
+    expect(newer[0].raisedAt).toBe(NOW.toISOString());
+  });
+
+  it("leaves out one stored later but raised before the newest shown", () => {
+    raiseDeclined(hoursBefore(1));
+    const [newestShown] = listNotifications(db, base.user.id);
+
+    raiseDeclined(hoursBefore(2));
+
+    expect(
+      listNotifications(db, base.user.id, { newerThan: newestShown })
+    ).toEqual([]);
+    expect(listNotifications(db, base.user.id)).toHaveLength(2);
+  });
+
+  it("returns nothing when no Notification is newer than the newest shown", () => {
+    raiseDeclined(hoursBefore(1));
+    const [newestShown] = listNotifications(db, base.user.id);
+
+    expect(
+      listNotifications(db, base.user.id, { newerThan: newestShown })
+    ).toEqual([]);
+  });
+
+  it("brings only unread arrivals under the Unread filter", () => {
+    raiseDeclined(hoursBefore(5));
+    const [newestShown] = listNotifications(db, base.user.id, {
+      filter: "unread",
+    });
+    raiseDeclined(hoursBefore(2));
+    raiseDeclined(hoursBefore(1));
+    const [oneHourAgo] = listNotifications(db, base.user.id);
+    markRead(db, base.user.id, oneHourAgo.id);
+
+    const newer = listNotifications(db, base.user.id, {
+      filter: "unread",
+      newerThan: newestShown,
+    });
+
+    expect(newer.map((n) => n.raisedAt)).toEqual([hoursBefore(2).toISOString()]);
+  });
+});
+
+describe("a new question", () => {
+  let lessonId: number;
+
+  beforeEach(() => {
+    const moduleId = db
+      .insert(schema.modules)
+      .values({ courseId: base.course.id, title: "Basics", position: 1 })
+      .returning()
+      .get().id;
+    lessonId = db
+      .insert(schema.lessons)
+      .values({ moduleId, title: "Closures", position: 1 })
+      .returning()
+      .get().id;
+  });
+
+  /** Posts a top-level comment on the lesson and raises its Notification Event. */
+  function ask(authorId: number, body = "How do closures work?") {
+    return db.transaction((tx) => {
+      const comment = tx
+        .insert(schema.comments)
+        .values({ userId: authorId, lessonId, parentId: null, body })
+        .returning()
+        .get();
+      notify(tx, {
+        kind: NotificationEventKind.NewQuestion,
+        actorId: authorId,
+        commentId: comment.id,
+        raisedAt: NOW,
+      });
+      return comment.id;
+    });
+  }
+
+  it("notifies the course's Instructor, naming the Student and the lesson", () => {
+    ask(base.user.id);
+
+    expect(listNotifications(db, base.instructor.id)).toMatchObject([
+      {
+        kind: NotificationEventKind.NewQuestion,
+        title: "Test User asked a question on Closures",
+        read: false,
+      },
+    ]);
+    expect(countUnread(db, base.instructor.id)).toBe(1);
+    expect(listNotifications(db, base.user.id)).toEqual([]);
+  });
+
+  it("notifies nobody when the Instructor asks on their own lesson", () => {
+    ask(base.instructor.id);
+
+    expect(listNotifications(db, base.instructor.id)).toEqual([]);
+    expect(countUnread(db, base.instructor.id)).toBe(0);
+  });
+
+  it("shows the lesson's current title after a rename", () => {
+    ask(base.user.id);
+    db.update(schema.lessons)
+      .set({ title: "Closures, again?" })
+      .where(eq(schema.lessons.id, lessonId))
+      .run();
+
+    expect(listNotifications(db, base.instructor.id)).toMatchObject([
+      { title: "Test User asked a question on Closures, again?" },
+    ]);
+  });
+
+  it("links to the question on the lesson page", () => {
+    const commentId = ask(base.user.id);
+
+    expect(listNotifications(db, base.instructor.id)).toMatchObject([
+      { link: `/courses/test-course/lessons/${lessonId}#comment-${commentId}` },
+    ]);
+  });
+
+  it("shows the question as plain text, markdown stripped", () => {
+    ask(
+      base.user.id,
+      [
+        "## Why `this` & <b>scope</b>?",
+        "",
+        "Is **this** the [right docs](https://example.com)? It's _odd_ &amp; ![a cat](cat.png)",
+        "",
+        "- first",
+        "- second",
+        "",
+        "```js",
+        "const a = 1 < 2;",
+        "```",
+      ].join("\n")
+    );
+
+    expect(listNotifications(db, base.instructor.id)).toMatchObject([
+      {
+        detail:
+          "Why this & <b>scope</b>? Is this the right docs? It's odd & a cat first second const a = 1 < 2;",
+      },
+    ]);
+  });
+
+  it("keeps angle brackets the Student typed, as the thread shows them", () => {
+    ask(base.user.id, "How do I type Array<string> inside <Suspense>?");
+
+    expect(listNotifications(db, base.instructor.id)).toMatchObject([
+      { detail: "How do I type Array<string> inside <Suspense>?" },
+    ]);
+  });
+
+  it("cuts a long question to about 140 characters", () => {
+    const words = Array.from({ length: 60 }, (_, i) => `word${i}`).join(" ");
+    ask(base.user.id, words);
+
+    const [notification] = listNotifications(db, base.instructor.id);
+    const detail = notification?.detail ?? "";
+    expect(detail.length).toBeLessThanOrEqual(141);
+    expect(detail.length).toBeGreaterThan(120);
+    expect(detail.startsWith("word0 word1 word2")).toBe(true);
+    expect(detail.endsWith("…")).toBe(true);
+  });
+
+  it("shows the question as edited", () => {
+    const commentId = ask(base.user.id, "How do closures work?");
+    db.update(schema.comments)
+      .set({ body: "How do **closures** capture variables?", editedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, commentId))
+      .run();
+
+    expect(listNotifications(db, base.instructor.id)).toMatchObject([
+      { detail: "How do closures capture variables?" },
+    ]);
+  });
+
+  it("says the question was deleted, still linking to its spot in the thread", () => {
+    const commentId = ask(base.user.id);
+    db.update(schema.comments)
+      .set({ deletedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, commentId))
+      .run();
+
+    expect(listNotifications(db, base.instructor.id)).toMatchObject([
+      {
+        title: "Test User asked a question on Closures",
+        link: `/courses/test-course/lessons/${lessonId}#comment-${commentId}`,
+        detail: "This comment was deleted.",
+      },
+    ]);
+  });
+});
+
+describe("a new reply", () => {
+  let lessonId: number;
+
+  beforeEach(() => {
+    const moduleId = db
+      .insert(schema.modules)
+      .values({ courseId: base.course.id, title: "Basics", position: 1 })
+      .returning()
+      .get().id;
+    lessonId = db
+      .insert(schema.lessons)
+      .values({ moduleId, title: "Closures", position: 1 })
+      .returning()
+      .get().id;
+  });
+
+  function addPerson(name: string) {
+    return db
+      .insert(schema.users)
+      .values({
+        name,
+        email: `${name.toLowerCase().replaceAll(" ", ".")}@example.com`,
+        role: UserRole.Student,
+      })
+      .returning()
+      .get();
+  }
+
+  /** Posts a top-level comment on the lesson, raising nothing. */
+  function question(authorId: number, body = "How do closures work?") {
+    return db
+      .insert(schema.comments)
+      .values({ userId: authorId, lessonId, parentId: null, body })
+      .returning()
+      .get().id;
+  }
+
+  /** Posts a reply in the question's thread and raises its Notification Event. */
+  function reply(
+    questionId: number,
+    authorId: number,
+    body = "A closure keeps its scope."
+  ) {
+    return db.transaction((tx) => {
+      const comment = tx
+        .insert(schema.comments)
+        .values({ userId: authorId, lessonId, parentId: questionId, body })
+        .returning()
+        .get();
+      notify(tx, {
+        kind: NotificationEventKind.NewReply,
+        actorId: authorId,
+        commentId: comment.id,
+        raisedAt: NOW,
+      });
+      return comment.id;
+    });
+  }
+
+  it("notifies the question's author, linking to the reply and showing its excerpt", () => {
+    const questionId = question(base.user.id, "How do closures work?");
+    const replyId = reply(
+      questionId,
+      base.instructor.id,
+      "A **closure** keeps its scope."
+    );
+
+    expect(listNotifications(db, base.user.id)).toEqual([
+      {
+        id: expect.any(Number),
+        kind: NotificationEventKind.NewReply,
+        title: "Test Instructor replied on Closures",
+        link: `/courses/test-course/lessons/${lessonId}#comment-${replyId}`,
+        detail: "A closure keeps its scope.",
+        refundStatus: null,
+        raisedAt: NOW.toISOString(),
+        read: false,
+      },
+    ]);
+    expect(countUnread(db, base.user.id)).toBe(1);
+  });
+
+  it("notifies the question's author and every earlier replier, each once", () => {
+    const sam = addPerson("Sam Student");
+    const kim = addPerson("Kim Student");
+    const questionId = question(base.user.id);
+    reply(questionId, sam.id);
+    reply(questionId, sam.id);
+    reply(questionId, base.user.id);
+
+    reply(questionId, kim.id, "Same question here.");
+
+    for (const participant of [base.user, sam]) {
+      expect(listNotifications(db, participant.id)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            title: "Kim Student replied on Closures",
+            detail: "Same question here.",
+          }),
+        ])
+      );
+      expect(
+        listNotifications(db, participant.id).filter(
+          (notification) => notification.title === "Kim Student replied on Closures"
+        )
+      ).toHaveLength(1);
+    }
+  });
+
+  it("never notifies the replier, even when they asked the question", () => {
+    const sam = addPerson("Sam Student");
+    const questionId = question(base.user.id);
+    reply(questionId, sam.id, "Have you read the docs?");
+
+    reply(questionId, base.user.id, "Yes, still stuck.");
+
+    expect(listNotifications(db, base.user.id)).toEqual([
+      expect.objectContaining({ title: "Sam Student replied on Closures" }),
+    ]);
+    expect(listNotifications(db, sam.id)).toMatchObject([
+      { title: "Test User replied on Closures", detail: "Yes, still stuck." },
+    ]);
+  });
+
+  it("still notifies people whose comments in the thread were deleted", () => {
+    const sam = addPerson("Sam Student");
+    const questionId = question(base.user.id);
+    const samsReplyId = reply(questionId, sam.id);
+    db.update(schema.comments)
+      .set({ deletedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, questionId))
+      .run();
+    db.update(schema.comments)
+      .set({ deletedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, samsReplyId))
+      .run();
+
+    reply(questionId, base.instructor.id, "Answering anyway.");
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { title: "Test Instructor replied on Closures" },
+      { title: "Sam Student replied on Closures" },
+    ]);
+    expect(listNotifications(db, sam.id)).toMatchObject([
+      { title: "Test Instructor replied on Closures" },
+    ]);
+  });
+
+  it("notifies nobody outside the thread", () => {
+    const sam = addPerson("Sam Student");
+    question(sam.id, "A different question.");
+    const questionId = question(base.user.id);
+
+    reply(questionId, base.instructor.id);
+
+    expect(listNotifications(db, sam.id)).toEqual([]);
+    expect(countUnread(db, sam.id)).toBe(0);
+  });
+
+  it("shows the reply as edited", () => {
+    const questionId = question(base.user.id);
+    const replyId = reply(questionId, base.instructor.id, "Use a closure.");
+    db.update(schema.comments)
+      .set({ body: "Use a `let` binding.", editedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, replyId))
+      .run();
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      { detail: "Use a let binding." },
+    ]);
+  });
+
+  it("cuts a long reply to about 140 characters", () => {
+    const questionId = question(base.user.id);
+    const words = Array.from({ length: 60 }, (_, i) => `word${i}`).join(" ");
+    reply(questionId, base.instructor.id, words);
+
+    const [notification] = listNotifications(db, base.user.id);
+    const detail = notification?.detail ?? "";
+    expect(detail.length).toBeLessThanOrEqual(141);
+    expect(detail.length).toBeGreaterThan(120);
+    expect(detail.endsWith("…")).toBe(true);
+  });
+
+  it("says the reply was deleted, still linking to its spot in the thread", () => {
+    const questionId = question(base.user.id);
+    const replyId = reply(questionId, base.instructor.id);
+    db.update(schema.comments)
+      .set({ deletedAt: NOW.toISOString() })
+      .where(eq(schema.comments.id, replyId))
+      .run();
+
+    expect(listNotifications(db, base.user.id)).toMatchObject([
+      {
+        title: "Test Instructor replied on Closures",
+        link: `/courses/test-course/lessons/${lessonId}#comment-${replyId}`,
+        detail: "This comment was deleted.",
+      },
+    ]);
+  });
+});
+
+describe("a claimed Seat", () => {
+  function addPerson(name: string) {
+    return db
+      .insert(schema.users)
+      .values({
+        name,
+        email: `${name.toLowerCase().replaceAll(" ", ".")}@example.com`,
+        role: UserRole.Student,
+      })
+      .returning()
+      .get();
+  }
+
+  /** A Team Licence on the base course. Returns its Seats' ids. */
+  function buySeats(teamAdminId: number, seats = 2) {
+    const team = db.insert(schema.teams).values({}).returning().get();
+    const teamLicence = db
+      .insert(schema.purchases)
+      .values({
+        userId: teamAdminId,
+        courseId: base.course.id,
+        amountPaid: 7900 * seats,
+      })
+      .returning()
+      .get();
+    return Array.from(
+      { length: seats },
+      (_, i) =>
+        db
+          .insert(schema.coupons)
+          .values({
+            teamId: team.id,
+            courseId: base.course.id,
+            code: `SEAT-${teamLicence.id}-${i}`,
+            purchaseId: teamLicence.id,
+          })
+          .returning()
+          .get().id
+    );
+  }
+
+  function seatClaimed(seatId: number, studentId: number) {
+    return {
+      kind: NotificationEventKind.SeatClaimed,
+      actorId: studentId,
+      seatId,
+      raisedAt: NOW,
+    } as const;
+  }
+
+  it("notifies the Team Admin who bought the Team Licence, linking to the Team page", () => {
+    const teamAdmin = addPerson("Bossy McBossface");
+    const [seatId] = buySeats(teamAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, seatClaimed(seatId, base.user.id));
+    });
+
+    expect(listNotifications(db, teamAdmin.id)).toEqual([
+      {
+        id: expect.any(Number),
+        kind: NotificationEventKind.SeatClaimed,
+        title: "Test User claimed a Seat on Test Course",
+        link: "/team",
+        detail: null,
+        refundStatus: null,
+        raisedAt: NOW.toISOString(),
+        read: false,
+      },
+    ]);
+    expect(countUnread(db, teamAdmin.id)).toBe(1);
+  });
+
+  it("notifies only that Team Admin, not the Student who claimed it", () => {
+    const teamAdmin = addPerson("Bossy McBossface");
+    const otherTeamAdmin = addPerson("Other Boss");
+    const [seatId] = buySeats(teamAdmin.id);
+    buySeats(otherTeamAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, seatClaimed(seatId, base.user.id));
+    });
+
+    expect(listNotifications(db, base.user.id)).toEqual([]);
+    expect(listNotifications(db, otherTeamAdmin.id)).toEqual([]);
+    expect(countUnread(db, otherTeamAdmin.id)).toBe(0);
+  });
+
+  it("doesn't notify a Team Admin who claims a Seat on their own Team Licence", () => {
+    const teamAdmin = addPerson("Bossy McBossface");
+    const [seatId] = buySeats(teamAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, seatClaimed(seatId, teamAdmin.id));
+    });
+
+    expect(listNotifications(db, teamAdmin.id)).toEqual([]);
+    expect(countUnread(db, teamAdmin.id)).toBe(0);
+  });
+
+  it("shows the course's current title after a rename", () => {
+    const teamAdmin = addPerson("Bossy McBossface");
+    const [seatId] = buySeats(teamAdmin.id);
+
+    db.transaction((tx) => {
+      notify(tx, seatClaimed(seatId, base.user.id));
+    });
+    db.update(schema.courses)
+      .set({ title: "What is TypeScript?" })
+      .where(eq(schema.courses.id, base.course.id))
+      .run();
+
+    expect(listNotifications(db, teamAdmin.id)).toMatchObject([
+      { title: "Test User claimed a Seat on What is TypeScript?" },
+    ]);
+  });
+});

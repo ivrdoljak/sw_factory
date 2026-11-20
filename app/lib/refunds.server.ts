@@ -1,7 +1,5 @@
 import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
-import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { alias } from "drizzle-orm/sqlite-core";
-import * as schema from "~/db/schema";
 import {
   coupons,
   courses,
@@ -14,8 +12,11 @@ import {
   users,
   videoWatchEvents,
   LessonProgressStatus,
+  NotificationEventKind,
   RefundStatus,
 } from "~/db/schema";
+import type { Db, Queryable } from "~/db/types";
+import { notify } from "~/lib/notifications.server";
 import { formatPrice } from "~/lib/utils";
 import {
   REFUND_COMPLETION_LIMIT,
@@ -31,10 +32,6 @@ import {
 //
 // Every function takes the database first, so tests can hand in an in-memory
 // one. Uses positional parameters (project convention).
-
-export type Db = BetterSQLite3Database<typeof schema>;
-type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type Queryable = Db | Tx;
 
 type Purchase = typeof purchases.$inferSelect;
 type Seat = typeof coupons.$inferSelect;
@@ -361,50 +358,68 @@ export function raiseRefundRequest(
   reason: string,
   now: Date
 ): RaiseResult {
-  const check = checkRefundRequest(db, purchaseId, buyerId, now);
-  if (!check.ok) return check;
+  return db.transaction((tx): RaiseResult => {
+    const check = checkRefundRequest(tx, purchaseId, buyerId, now);
+    if (!check.ok) return check;
 
-  const { purchase } = check;
-  const buyer = db.select().from(users).where(eq(users.id, buyerId)).get();
-  const course = db
-    .select()
-    .from(courses)
-    .where(eq(courses.id, purchase.courseId))
-    .get();
+    const { purchase } = check;
+    const buyer = tx.select().from(users).where(eq(users.id, buyerId)).get();
+    const course = tx
+      .select()
+      .from(courses)
+      .where(eq(courses.id, purchase.courseId))
+      .get();
 
-  if (!buyer || !course) {
-    return { ok: false, status: 404, error: "Purchase not found." };
-  }
+    if (!buyer || !course) {
+      return { ok: false, status: 404, error: "Purchase not found." };
+    }
 
-  const refundRequest = db
-    .insert(refunds)
-    .values({
-      purchaseId: purchase.id,
-      status: RefundStatus.Open,
-      reason,
-      requestedAt: now.toISOString(),
-    })
-    .returning()
-    .get();
+    const refundRequest = tx
+      .insert(refunds)
+      .values({
+        purchaseId: purchase.id,
+        status: RefundStatus.Open,
+        reason,
+        requestedAt: now.toISOString(),
+      })
+      .returning()
+      .get();
 
+    notify(tx, {
+      kind: NotificationEventKind.RefundRequestRaised,
+      actorId: buyerId,
+      refundRequestId: refundRequest.id,
+      raisedAt: now,
+    });
+
+    return {
+      ok: true,
+      refundRequestId: refundRequest.id,
+      kind: kindOf(getSeats(tx, purchase.id)),
+      email: buildRequestedEmail(buyer, course, purchase),
+    };
+  });
+}
+
+/** The email the buyer gets once they have raised a Refund Request. */
+function buildRequestedEmail(
+  buyer: typeof users.$inferSelect,
+  course: typeof courses.$inferSelect,
+  purchase: Purchase
+): Email {
   return {
-    ok: true,
-    refundRequestId: refundRequest.id,
-    kind: kindOf(getSeats(db, purchase.id)),
-    email: {
-      to: buyer.email,
-      subject: `Refund requested — ${course.title}`,
-      body: [
-        `Hi ${buyer.name},`,
-        "",
-        `We have your refund request for "${course.title}".`,
-        `The refund is for ${formatPrice(purchase.amountPaid)}, the amount you paid.`,
-        "",
-        "Our team reviews every refund request by hand. You do not need to do anything else — we will email you again when it is done.",
-        "",
-        "— The Cadence team",
-      ].join("\n"),
-    },
+    to: buyer.email,
+    subject: `Refund requested — ${course.title}`,
+    body: [
+      `Hi ${buyer.name},`,
+      "",
+      `We have your refund request for "${course.title}".`,
+      `The refund is for ${formatPrice(purchase.amountPaid)}, the amount you paid.`,
+      "",
+      "Our team reviews every refund request by hand. You do not need to do anything else — we will email you again when it is done.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
   };
 }
 
@@ -677,6 +692,13 @@ export function approveRefundRequest(
       .where(eq(refunds.id, refundRequestId))
       .run();
 
+    notify(tx, {
+      kind: NotificationEventKind.RefundRequestApproved,
+      actorId: platformAdminId,
+      refundRequestId,
+      raisedAt: now,
+    });
+
     return {
       ok: true,
       email: buildDecisionEmail(tx, purchase, RefundStatus.Approved, note),
@@ -719,6 +741,13 @@ export function declineRefundRequest(
       })
       .where(eq(refunds.id, refundRequestId))
       .run();
+
+    notify(tx, {
+      kind: NotificationEventKind.RefundRequestDeclined,
+      actorId: platformAdminId,
+      refundRequestId,
+      raisedAt: now,
+    });
 
     return {
       ok: true,
